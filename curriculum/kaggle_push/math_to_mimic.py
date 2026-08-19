@@ -257,15 +257,52 @@ def embed_math_block(X18: np.ndarray,
 # <<< VENDOR (mimic_contract) — do not edit outside the reference module
 # ---------------------------- math exam generators (exam machinery)
 
+# CERTIFIED Phase-1 generator, byte-identical to math_school_train.py
+# (lines 55-220, the frozen v9/v10 artifact). The v4/v5 exam used a
+# re-implemented continuum with different constants (A=1 fixed, tau~
+# U(20,90), raw lorenz, uniform drops) — distribution mismatch; the
+# epoch-0 exam failed even with perfect weights (v5: 0.36-0.75 vs certs
+# ~0.98). The exam MUST test the model on windows drawn exactly as the
+# Phase-1 certificate did.
+
+T_STAY = 256
+SLIDE = 2
+CAP_WINDOWS = 24
+DROP_LO, DROP_HI = 0.4, 0.8
+DROP_RANGES = {"lorenz": (0.20, 0.50), "sine": (0.30, 0.70),
+               "cosine": (0.30, 0.70)}
+
 LORENZ_SIGMA, LORENZ_RHO, LORENZ_BETA = 10.0, 28.0, 8.0 / 3.0
 LORENZ_DT = 0.02
 LORENZ_STEPS = 2000
 
+BOUNDS = {
+    "sine": (-1.75, 1.75), "cosine": (-1.75, 1.75),
+    "decay": (-0.05, 2.20), "step": (-1.20, 1.20),
+    "sigmoid": (-1.20, 1.20), "lorenz": (-4.00, 4.00),
+}
 
-def lorenz_x(g: np.random.Generator, n: int = LORENZ_STEPS,
-             dt: float = LORENZ_DT) -> np.ndarray:
+
+class Rng:
+    def __init__(self, seed):
+        self.g = np.random.default_rng(seed)
+
+    def uniform(self, lo, hi, size=None):
+        return self.g.uniform(lo, hi, size)
+
+    def normal(self, loc, scale, size=None):
+        return self.g.normal(loc, scale, size)
+
+    def random(self, size=None):
+        return self.g.random(size)
+
+    def integers(self, lo, hi):
+        return int(self.g.integers(lo, hi))
+
+
+def lorenz_x(stay_rng, n=LORENZ_STEPS, dt=LORENZ_DT):
     s, r, b = LORENZ_SIGMA, LORENZ_RHO, LORENZ_BETA
-    x, y, z = 1.0 + g.normal(0, 0.05, 3)
+    x, y, z = 1.0 + stay_rng.normal(0, 0.05, 3)
     xs = np.empty(n)
     for i in range(n):
         xs[i] = x
@@ -283,63 +320,94 @@ def lorenz_x(g: np.random.Generator, n: int = LORENZ_STEPS,
     return xs
 
 
-def continuum(g: np.random.Generator) -> np.ndarray:
-    """One 256-step stay of the 6 math channels (sine..lorenz)."""
-    V = np.zeros((256, 6))
-    t = np.arange(256)
-    freqs = g.uniform(0.02, 0.08, 2)
-    phases = g.uniform(0, 2 * np.pi, 2)
-    V[:, 0] = np.sin(freqs[0] * t + phases[0])
-    V[:, 1] = np.cos(freqs[1] * t + phases[1])
-    V[:, 2] = 2.0 * np.exp(-t / g.uniform(20, 90)) + g.uniform(0, 0.02)
-    for _ in range(int(g.integers(1, 4))):
-        a = int(g.integers(1, 251))
-        V[a:, 3] = g.uniform(-0.9, 0.9)
-    mid = int(g.integers(1, 251))
-    V[:, 4] = g.uniform(-1.0, 1.0) / (1.0 + np.exp(-(t - mid) / 12.0))
-    idx = int(g.integers(0, LORENZ_STEPS - 256))
-    V[:, 5] = lorenz_x(g)[idx: idx + 256]
+def continuum(stay_rng):
+    T = T_STAY
+    t = np.arange(T, dtype=float)
+    V = np.empty((T, K_MATH))
+    A = stay_rng.uniform(0.5, 1.5)
+    f1 = stay_rng.uniform(0.02, 0.12)
+    phi = stay_rng.uniform(0, 2 * np.pi)
+    V[:, 0] = A * np.sin(2 * np.pi * f1 * t + phi)
+    V[:, 1] = A * np.cos(2 * np.pi * f1 * t + phi)
+    A2 = stay_rng.uniform(1.0, 2.0)
+    tau = stay_rng.uniform(8.0, 45.0)
+    V[:, 2] = A2 * np.exp(-t / tau)
+    lo = stay_rng.uniform(-1.0, -0.2)
+    hi = stay_rng.uniform(0.2, 1.0)
+    n_steps = stay_rng.integers(1, 3)
+    level = np.ones(T) * lo
+    for k in range(n_steps):
+        t0 = int(stay_rng.uniform(0.2 * T, 0.9 * T))
+        level[t0:] = hi if k % 2 == 0 else lo
+    V[:, 3] = level
+    t0 = stay_rng.uniform(0.3 * T, 0.7 * T)
+    width = stay_rng.uniform(2.0, 12.0)
+    V[:, 4] = lo + (hi - lo) / (1.0 + np.exp(-(t - t0) / width))
+    xraw = lorenz_x(stay_rng)
+    idx = np.linspace(0, len(xraw) - 1, T).astype(int)
+    xs = xraw[idx]
+    V[:, 5] = 2.0 * xs / max(np.abs(xs).max(), 1e-9)
     return V
 
 
-def exam_windows(n_windows: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(B, W, 18) Phase-1-parity exam windows (ALL kinds active) + Y, M.
+def damage(stay_rng, V):
+    T, K = V.shape
+    value = np.zeros_like(V)
+    mask = np.zeros_like(V)
+    delta = np.zeros_like(V)
+    for k, kind in enumerate(EXAM_KINDS):
+        lo_, hi_ = DROP_RANGES.get(kind, (DROP_LO, DROP_HI))
+        p = stay_rng.uniform(lo_, hi_)
+        obs = stay_rng.random(T) >= p
+        last = -1
+        for i in range(T):
+            if obs[i]:
+                value[i, k] = V[i, k]
+                mask[i, k] = 1.0
+                delta[i, k] = 0.0
+                last = i
+            else:
+                delta[i, k] = min(i - last, DELTA_CAP) if last >= 0 else DELTA_CAP
+                value[i, k] = value[last, k] if last >= 0 else 0.0
+    return value, mask, delta
 
-    Byte-identical distribution to the Phase-1 certificate protocol:
-    the exam grades every kind on full multi-kind windows (masked R2 on
-    dropped slots), exactly like math_school_train.py's grading exam.
-    The Phase-2 single-kind variant is REFUTED — transferred columns are
-    out-of-distribution with 5 dormant triplets (epoch-0 baseline already
-    failed: step 0.683, lorenz -0.064, sine 0.821).
+
+def build_dataset(n_stays, seed):
+    rng = Rng(seed)
+    all_x, all_y, all_m = [], [], []
+    for i in range(n_stays):
+        sr = Rng(int(rng.integers(0, 2 ** 31)))
+        V = continuum(sr)
+        value, mask, delta = damage(sr, V)
+        T, K = V.shape
+        n_win = (T - W) // SLIDE + 1
+        idx = np.arange(n_win)
+        if n_win > CAP_WINDOWS:
+            g2 = np.random.default_rng(1000 + i)
+            idx = np.sort(g2.choice(idx, size=CAP_WINDOWS, replace=False))
+        for s in idx:
+            a, b = s * SLIDE, s * SLIDE + W
+            x = np.empty((W, K * 3))
+            x[:, 0::3] = value[a:b]
+            x[:, 1::3] = mask[a:b]
+            x[:, 2::3] = delta[a:b]
+            all_x.append(x)
+            all_y.append(V[a:b])
+            all_m.append(mask[a:b])
+    return (np.stack(all_x), np.stack(all_y), np.stack(all_m))
+
+
+def exam_windows(n_windows: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(B, W, 18) exam windows drawn by the CERTIFIED Phase-1 generator.
+
+    Byte-identical to the Phase-1 certificate protocol: build_dataset
+    (same continuum amplitudes/frequencies/taus, same per-kind drop
+    ranges, same SLIDE/cap windowing, same RNG seeding) so the exam tests
+    the transferred model on the EXACT distribution it was certified on.
     """
-    g = _rng(seed)
-    X, Y, M = [], [], []
-    for i in range(n_windows):
-        V = continuum(_rng(int(g.integers(0, 2 ** 31))))
-        start = int(g.integers(0, 256 - W))
-        win = V[start: start + W]                       # (W, 6) true
-        mask = (g.random((W, 6)) >= g.uniform(0.30, 0.70)).astype(np.float32)
-        ff = win.copy()
-        for k in range(6):
-            last = None
-            for t in range(W):
-                if mask[t, k] > 0.5:
-                    last = win[t, k]
-                elif last is not None:
-                    ff[t, k] = last
-        delta = np.zeros_like(win)
-        for k in range(6):
-            last = -1
-            for t in range(W):
-                if mask[t, k] > 0.5:
-                    last = t
-                elif last >= 0:
-                    delta[t, k] = min(t - last, DELTA_CAP)
-                else:
-                    delta[t, k] = DELTA_CAP
-        x = np.stack([ff, mask, delta], axis=-1).reshape(W, 18).astype(np.float32)
-        X.append(x); Y.append(win.astype(np.float32)); M.append(mask)
-    return np.stack(X), np.stack(Y), np.stack(M)
+    n_stays = max(1, n_windows // CAP_WINDOWS)
+    X, Y, M = build_dataset(n_stays, seed)
+    return X[:n_windows], Y[:n_windows], M[:n_windows]
 
 
 # ---------------------------- checkpoint discovery
