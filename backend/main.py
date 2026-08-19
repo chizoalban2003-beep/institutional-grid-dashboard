@@ -16,8 +16,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import os, json, glob
-from typing import Optional
+import sys, os
+# Add bridge to path so it can be imported
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from bridge.fhir_bridge import PatientState, ingest_fhir_bundle, build_diagnostic_report
+
+# ─── FHIR Patient State Store ────────────────────────────────────────────────
+
+fhir_patients: dict[str, PatientState] = {}  # patient_id -> PatientState
+fhir_audit_log: list[dict] = []  # DiagnosticReports for audit ledger
 
 app = FastAPI(title="Institutional Grid Inference Engine")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -468,3 +475,169 @@ def stream(req: StreamRequest):
         'governance': req.governance,
         'trajectory': trajectory,
     }
+
+
+# ─── FHIR Bridge Endpoints ───────────────────────────────────────────────────
+
+class FHIRBundleRequest(BaseModel):
+    patient_id: str
+    bundle: dict
+    governance: dict = {"cost_scale": 1.0, "risk_scale": 1.0, "bounty": 1.0}
+
+
+class FHIRPredictRequest(BaseModel):
+    patient_id: str
+    governance: dict = {"cost_scale": 1.0, "risk_scale": 1.0, "bounty": 1.0}
+
+
+@app.post("/fhir/ingest")
+def fhir_ingest(req: FHIRBundleRequest):
+    """Ingest a FHIR Bundle of observations for a patient.
+
+    Accepts standard FHIR Observation/Condition resources and updates
+    the patient's temporal state. Returns ingestion statistics.
+    """
+    global fhir_patients
+
+    if req.patient_id not in fhir_patients:
+        fhir_patients[req.patient_id] = PatientState(patient_id=req.patient_id)
+
+    ps = fhir_patients[req.patient_id]
+    result = ingest_fhir_bundle(ps, req.bundle)
+
+    return {
+        "patient_id": req.patient_id,
+        "ingestion": result,
+        "current_hour": ps.hour,
+    }
+
+
+@app.post("/fhir/predict")
+def fhir_predict(req: FHIRPredictRequest):
+    """Run inference on current patient state from FHIR observations.
+
+    Uses the patient's tracked feature values to build a tensor,
+    runs the Grid model, and returns prediction + cell economy.
+    """
+    if model is None:
+        raise HTTPException(500, "Model not loaded")
+    if req.patient_id not in fhir_patients:
+        raise HTTPException(404, f"Patient {req.patient_id} not found. Send observations first.")
+
+    ps = fhir_patients[req.patient_id]
+
+    # Build tensor from current state
+    tensor = ps.get_window_tensor(z_mu, z_sd)  # (W, K*3)
+    x = torch.from_numpy(tensor).unsqueeze(0)  # (1, W, K*3)
+
+    with torch.no_grad():
+        out = model(x, governance=req.governance, training=False)
+
+    pred = float(out['predictions'][0])
+    bids = out['bids'][0].numpy().tolist()
+    pie = out['pie_weights'][0].numpy().tolist()
+    selected = out['selected_idx'][0].numpy().tolist()
+
+    # Jurisdiction aggregation
+    jurisdictions = ["VITALS", "HYDRATION", "MOBILITY", "COGNITIVE", "OPERATIONAL"]
+    jur_pies = {}
+    cells_per_jur = N_CELLS // len(jurisdictions)
+    for i, jur in enumerate(jurisdictions):
+        start_c = i * cells_per_jur
+        end_c = start_c + cells_per_jur
+        jur_pie = np.array(pie)[:, start_c:end_c].mean(axis=1)
+        jur_pies[jur] = {
+            'cost': float(jur_pie[0]),
+            'risk': float(jur_pie[1]),
+            'neutrality': float(jur_pie[2]),
+        }
+
+    # Top bidding cells
+    top_bids = sorted(range(len(bids)), key=lambda i: -bids[i])[:5]
+    top_cell_info = []
+    for ci in top_bids:
+        jur_idx = ci // cells_per_jur
+        jur = jurisdictions[min(jur_idx, len(jurisdictions)-1)]
+        top_cell_info.append({
+            'cell_id': ci,
+            'jurisdiction': jur,
+            'bid': bids[ci],
+            'pie': {'cost': pie[0][ci], 'risk': pie[1][ci], 'neutrality': pie[2][ci]},
+        })
+
+    alert_triggered = pred > 0.5
+
+    # Generate FHIR DiagnosticReport for audit ledger
+    report = build_diagnostic_report(
+        patient_id=req.patient_id,
+        prediction=pred,
+        governance=req.governance,
+        jurisdiction_pies=jur_pies,
+        top_cells=top_cell_info,
+        alert_triggered=alert_triggered,
+    )
+    fhir_audit_log.append(report)
+
+    return {
+        "patient_id": req.patient_id,
+        "hour": ps.hour,
+        "prediction": round(pred, 4),
+        "alert": alert_triggered,
+        "governance": req.governance,
+        "jurisdiction_pies": jur_pies,
+        "top_cells": top_cell_info,
+        "selected_indices": selected,
+        "n_features_observed": sum(1 for fs in ps.features.values() if fs.last_value is not None),
+    }
+
+
+@app.get("/fhir/patient/{patient_id}/state")
+def fhir_patient_state(patient_id: str):
+    """Get current patient state from tracked FHIR observations."""
+    if patient_id not in fhir_patients:
+        raise HTTPException(404, f"Patient {patient_id} not found")
+
+    ps = fhir_patients[patient_id]
+    values, mask, delta = ps.get_current_vector()
+
+    feature_summary = {}
+    for name, fs in ps.features.items():
+        if fs.last_value is not None:
+            feature_summary[name] = {
+                "value": fs.last_value,
+                "observed": True,
+                "hours_since_obs": round(fs.time_since_observation, 2),
+            }
+        else:
+            feature_summary[name] = {
+                "value": None,
+                "observed": False,
+                "n_missing": fs.n_missing,
+            }
+
+    return {
+        "patient_id": patient_id,
+        "hour": ps.hour,
+        "n_features_observed": sum(1 for fs in ps.features.values() if fs.last_value is not None),
+        "n_total_features": len(ps.features),
+        "completeness": round(sum(mask) / len(mask) * 100, 1),
+        "features": feature_summary,
+    }
+
+
+@app.get("/fhir/audit")
+def fhir_audit(limit: int = 10):
+    """Get recent FHIR DiagnosticReports from the audit ledger."""
+    return {
+        "total_reports": len(fhir_audit_log),
+        "recent": fhir_audit_log[-limit:],
+    }
+
+
+@app.post("/fhir/patient/{patient_id}/reset")
+def fhir_reset_patient(patient_id: str):
+    """Reset patient state (for testing / new admission)."""
+    global fhir_patients
+    if patient_id in fhir_patients:
+        del fhir_patients[patient_id]
+    return {"patient_id": patient_id, "status": "reset"}

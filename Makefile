@@ -1,4 +1,4 @@
-.PHONY: setup download-ckpt build run stop clean
+.PHONY: setup download-ckpt build run stop clean test test-fhir fhir-demo
 
 # Download trained checkpoint from Kaggle
 download-ckpt:
@@ -24,8 +24,13 @@ run:
 	@echo ""
 	@echo "Dashboard: http://localhost:8501"
 	@echo "API:       http://localhost:8000/docs"
+	@echo "FHIR API:  http://localhost:8000/fhir/audit"
 	@echo ""
 	@echo "Wait ~10s for the backend to load the model..."
+
+# Run backend only (for FHIR development)
+run-api:
+	cd backend && uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 # Stop the dashboard
 stop:
@@ -35,3 +40,30 @@ stop:
 clean:
 	docker compose down --rmi local
 	rm -rf backend/checkpoints/* data/*
+
+# Run all tests
+test:
+	python3 -m pytest bridge/test_fhir_bridge.py -v
+
+# Run FHIR bridge tests only
+test-fhir:
+	python3 -m pytest bridge/test_fhir_bridge.py -v --tb=short
+
+# Run the FHIR demo (mock EHR client → live backend)
+fhir-demo:
+	@echo "Starting FHIR demo — ensure backend is running on :8000"
+	python3 bridge/mock_ehr_client.py --scenario deteriorating --n-hours 24 --interval 0.5
+
+# Run the FHIR healthy demo
+fhir-demo-healthy:
+	@echo "Starting FHIR healthy patient demo"
+	python3 bridge/mock_ehr_client.py --scenario healthy --n-hours 24 --interval 0.5
+
+# Generate FHIR example bundles for documentation
+fhir-examples:
+	python3 -c "\
+	import json; \
+	from bridge.mock_ehr_client import scenario_healthy, scenario_deteriorating; \
+	print(json.dumps(scenario_healthy(0), indent=2)); \
+	print('---'); \
+	print(json.dumps(scenario_deteriorating(0), indent=2))"
