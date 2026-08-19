@@ -61,12 +61,29 @@ COLUMN_COPY_SPEC = {
     ],
 }
 
+# DORMANT-INPUT ZEROING (v5 fix, physics verified): dormant clinical
+# triplets carry mask=1.0 (constant), so randomly re-initialized clinical
+# input-projection columns inject a fixed bias into every GRU/decode gate
+# at exam time -> the recurrent machinery leaves the Phase-1 operating
+# point and the epoch-0 exam baseline collapses (v4: 0.38/0.33/0.44/0.52/
+# 0.59/-0.06 vs Phase-1 certs ~0.98). Zero-init makes dormant slots
+# contribute EXACTLY zero -> the math-only forward is byte-identical to
+# Phase-1. Clinical columns still learn (gradients flow during clinical
+# training where their inputs are non-constant). Values filled by
+# zero_columns_spec_for() at the bottom (needs D_IN/K_MATH constants).
+
 K_MATH = 6
 K_CLINICAL = 33
 D_IN = 117
 CLINICAL_SLOT = K_MATH * 3  # 18
 HIDDEN = 192
 N_CELLS = 100
+
+ZERO_COLUMNS_SPEC = {
+    "gru.weight_ih_l0": [(18, D_IN)],
+    "decode_cell.weight_ih": [(18, D_IN), (D_IN + 64 + K_MATH,
+                                           D_IN + 64 + K_MATH + K_CLINICAL)],
+}
 
 
 def split_transfer_keys(state_dict: dict) -> tuple[list[str], list[str]]:
@@ -195,6 +212,15 @@ def normalize_fisher_global(f2: dict) -> dict:
     if not np.isfinite(mean) or mean <= 0.0:
         raise ValueError(f"bad global Fisher mean: {mean}")
     return {k: np.asarray(v, dtype=np.float64) / mean for k, v in f2.items()}
+
+
+def zero_columns_spec_for(phase2_ctx: int) -> dict:
+    """ZERO_COLUMNS_SPEC with the Phase-2 decode ctx width filled in."""
+    return {
+        "gru.weight_ih_l0": [(18, D_IN)],
+        "decode_cell.weight_ih": [(18, D_IN), (D_IN + 64 + K_MATH,
+                                               phase2_ctx)],
+    }
 
 
 def risk_weights(values, mask, drop_weight: float = 3.0):

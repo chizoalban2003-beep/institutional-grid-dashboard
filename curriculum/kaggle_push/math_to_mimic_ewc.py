@@ -378,6 +378,15 @@ COLUMN_COPY_SPEC = {
         (181, 187, 82, 88),
     ],
 }
+# DORMANT-INPUT ZEROING (v5 fix): randomly re-initialized clinical input
+# columns multiply the dormant mask=1.0 constant -> fixed gate bias at
+# exam time -> epoch-0 exam collapses. Zero-init makes dormant slots
+# exactly silent; clinical columns still learn in clinical training.
+ZERO_COLUMNS_SPEC = {
+    "gru.weight_ih_l0": [(18, D_IN)],
+    "decode_cell.weight_ih": [(18, D_IN), (D_IN + 64 + K_MATH,
+                                           D_IN + 64 + K_SUBJECTS)],
+}
 
 
 def load_transfer(ckpt_path, model):
@@ -397,11 +406,17 @@ def load_transfer(ckpt_path, model):
             copied.append(k)
         else:
             reinit.append(k)
+    for k, blocks in ZERO_COLUMNS_SPEC.items():
+        if k in sd_model:
+            with torch.no_grad():
+                for tlo, thi in blocks:
+                    sd_model[k][:, tlo:thi] = 0.0
     model.load_state_dict(sd_model)
     print(f"[transfer] copied {len(copied)} keys: {sorted(copied)}")
     print(f"[transfer] column-copied {len(partial_copied)} keys: "
           f"{sorted(partial_copied)}")
     print(f"[transfer] re-init {len(reinit)} keys: {sorted(reinit)}")
+    print(f"[transfer] dormant-input zeroed: {sorted(ZERO_COLUMNS_SPEC)}")
     return copied, partial_copied, reinit
 
 

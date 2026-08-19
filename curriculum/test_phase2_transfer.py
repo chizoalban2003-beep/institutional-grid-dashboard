@@ -4,9 +4,10 @@ import numpy as np
 import pytest
 
 from curriculum.phase2_transfer import (
-    COLUMN_COPY_SPEC, TRANSFER_KEYS, dims_for_phase2, map_fisher_to_phase2,
-    normalize_fisher_global, partial_key, plan_transfer, risk_weights,
-    risk_weighted_fidelity, split_transfer_keys, transferable,
+    COLUMN_COPY_SPEC, TRANSFER_KEYS, ZERO_COLUMNS_SPEC, dims_for_phase2,
+    map_fisher_to_phase2, normalize_fisher_global, partial_key,
+    plan_transfer, risk_weights, risk_weighted_fidelity, split_transfer_keys,
+    transferable,
 )
 
 
@@ -122,6 +123,26 @@ def test_fisher_map_blocks_match_column_spec():
     f2 = map_fisher_to_phase2(_fake_fisher_p1())
     for tlo, thi, slo, shi in COLUMN_COPY_SPEC["decode_cell.weight_ih"]:
         assert np.all(f2["decode_cell.weight_ih"][:, tlo:thi] == 0.25)
+
+
+def test_zero_columns_spec_covers_all_reinit_input_columns():
+    # the columns zeroed must be EXACTLY the non-copied input columns:
+    # gru 18:117 (all clinical), decode 18:117 (clinical window) and
+    # 187:220 (prev clinical heads) — nothing else.
+    gru = ZERO_COLUMNS_SPEC["gru.weight_ih_l0"]
+    assert gru == [(18, 117)]
+    dec = ZERO_COLUMNS_SPEC["decode_cell.weight_ih"]
+    assert dec == [(18, 117), (187, 220)]
+    # no overlap with the copied column blocks
+    for tlo, thi, _, _ in COLUMN_COPY_SPEC["gru.weight_ih_l0"]:
+        assert all(tlo >= hi or thi <= lo for lo, hi in gru)
+    for tlo, thi, _, _ in COLUMN_COPY_SPEC["decode_cell.weight_ih"]:
+        assert all(tlo >= hi or thi <= lo for lo, hi in dec)
+    # union covers the full width (nothing silently left random-active)
+    all_gru = sorted(x for b in gru for x in b)
+    assert all_gru == [18, 117]
+    all_dec = sorted(x for b in dec for x in b)
+    assert all_dec == [18, 117, 187, 220]
 
 
 def test_partial_key_detects_spec():
