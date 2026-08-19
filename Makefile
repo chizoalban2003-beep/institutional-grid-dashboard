@@ -1,4 +1,4 @@
-.PHONY: setup download-ckpt build run stop clean test test-fhir test-mimic fhir-demo
+.PHONY: setup download-ckpt build run stop clean test test-fhir test-mimic test-loader fhir-demo
 
 # Download trained checkpoint from Kaggle
 download-ckpt:
@@ -43,7 +43,7 @@ clean:
 
 # Run all tests
 test:
-	python3 -m pytest bridge/test_fhir_bridge.py data_engine/test_mimic_ingest.py -v
+	python3 -m pytest bridge/test_fhir_bridge.py data_engine/test_mimic_ingest.py backend/mimic/test_mimic_loader.py -v
 
 # Run FHIR bridge tests only
 test-fhir:
@@ -52,6 +52,10 @@ test-fhir:
 # Run MIMIC ingestion tests only
 test-mimic:
 	python3 -m pytest data_engine/test_mimic_ingest.py -v --tb=short
+
+# Run MIMIC backend loader tests
+test-loader:
+	python3 -m pytest backend/mimic/test_mimic_loader.py -v --tb=short
 
 # Generate synthetic MIMIC data for pipeline testing
 mimic-generate:
