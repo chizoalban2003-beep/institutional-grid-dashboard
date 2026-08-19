@@ -141,9 +141,46 @@ The bridge maps **39 clinical features** via LOINC/SNOMED codes from FHIR Observ
 
 Full mapping in `bridge/fhir_bridge.py`.
 
-## Tests
+## MIMIC-IV Data Engine
+
+The `data_engine/` module translates MIMIC-IV's relational EHR tables into the Grid's tensor format:
 
 ```bash
-make test       # All tests (17 passing)
+# Generate synthetic MIMIC data (100 ICU stays)
+make mimic-generate
+
+# Run MIMIC ingestion tests
+make test-mimic
+```
+
+### Architecture
+
+```
+MIMIC-IV CSV/Parquet ──→ MIMICStayAssembler ──→ (T, K×3) tensor
+  chartevents.csv         - Forward fill         - Value (z-scored)
+  labevents.csv           - Delta computation     - Mask (0/1)
+  icustays.csv            - Window extraction     - Delta (hours since obs)
+```
+
+### Features
+
+- **100+ MIMIC itemids** mapped to 34 clinical features (plus 5 metadata)
+- **Irregular sampling** → hourly bins with forward-fill
+- **12h+ lab delays** handled via delta tracking (capped at 48h)
+- **Memmap output** for memory-efficient tensor storage
+- **Synthetic data generator** for pipeline validation without full dataset
+
+### Tensor Format
+
+Each patient-hour becomes a `(W, K×3)` tensor:
+- **W** = 14 (window size, hours)
+- **K** = 39 (clinical features)
+- **K×3** = `[z_value || mask || delta]` per feature
+
+### Tests
+
+```bash
+make test       # All tests (34 passing: 17 FHIR + 17 MIMIC)
 make test-fhir  # FHIR bridge tests
+make test-mimic # MIMIC ingestion tests
 ```

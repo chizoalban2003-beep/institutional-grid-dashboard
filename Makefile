@@ -1,4 +1,4 @@
-.PHONY: setup download-ckpt build run stop clean test test-fhir fhir-demo
+.PHONY: setup download-ckpt build run stop clean test test-fhir test-mimic fhir-demo
 
 # Download trained checkpoint from Kaggle
 download-ckpt:
@@ -43,11 +43,19 @@ clean:
 
 # Run all tests
 test:
-	python3 -m pytest bridge/test_fhir_bridge.py -v
+	python3 -m pytest bridge/test_fhir_bridge.py data_engine/test_mimic_ingest.py -v
 
 # Run FHIR bridge tests only
 test-fhir:
 	python3 -m pytest bridge/test_fhir_bridge.py -v --tb=short
+
+# Run MIMIC ingestion tests only
+test-mimic:
+	python3 -m pytest data_engine/test_mimic_ingest.py -v --tb=short
+
+# Generate synthetic MIMIC data for pipeline testing
+mimic-generate:
+	python3 data_engine/synthetic_mimic.py --output /tmp/synthetic_mimic --n-stays 100
 
 # Run the FHIR demo (mock EHR client → live backend)
 fhir-demo:
