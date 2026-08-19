@@ -1,0 +1,25 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    networks:
+      - grid-net
+    volumes:
+      - ./backend/checkpoints:/app/checkpoints:ro
+      - ./data:/app/data:ro
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8501:8501"
+    environment:
+      - BACKEND_URL=http://backend:8000
+    depends_on:
+      - backend
+    networks:
+      - grid-net
+
+networks:
+  grid-net:
+    driver: bridge
