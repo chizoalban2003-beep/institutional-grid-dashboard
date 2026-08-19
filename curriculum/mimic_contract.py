@@ -1,26 +1,34 @@
 """MIMIC-contract reference generators (numpy-only, torch-free, testable).
 
-Single source of truth for the Phase-2 (math-to-MIMIC) kernel's data
-contracts. The kernel vendors a byte-identical copy via
+Single source of truth for the Phase-2 (math-to-MIMIC) kernel's clinical
+data contract. The kernel vendors a byte-identical copy via
 curriculum/sync_vendored.py (marked block below); the parity harness
 diff-verifies the two copies after ANY edit.
 
-Two contracts:
+Sub-grid geometry (user-locked 2026-08-19): the Phase-2 model is a single
+(M=6 math subjects, C=33 clinical features) grid:
 
-1. math exam — per-kind single-channel windows (sine/cosine/decay/step/
-   sigmoid/lorenz) used for the no-forgetting readout exam and the
-   LAMBDA_MATH anchor loss. Since Phase-2 heads are per-feature, each
-   exam window carries ONE kind; the model's head[kind] must reproduce
-   it (readout + priors retention).
+    heads  0..5   = Phase-1 math kinds (sine cosine decay step sigmoid
+                    lorenz) — permanent, transfer-initialized
+    heads  6..38  = MIMIC clinical targets (FEATURE_NAMES_CLINICAL)
+    input  (B, W, 117) = [math triplets 0:18] + [clinical triplets 18:117]
 
-2. clinical windows — (B, W, K*3) [value_ffill, mask, delta] triplets
-   over the 39 FEATURE_NAMES, mirroring data_engine/mimic_ingest.py's
-   semantics: vitals rhythmic+trend with low missingness, labs slow
-   high-missingness, per-feature z scores via TRAIN stats, ffill
-   (causal, no backward fill), mask column, delta = hours since last
-   observation (backward-looking, CAPPED at DELTA_CAP, 0 on observed
-   slots). Demographics (Age..HospAdmTime, indices 34..38) always
-   observed.
+Dormant-slot protocol: a domain's channels carry value=0, mask=1, delta=0
+when the OTHER domain is active (hard copy pins the head output to 0,
+prev-feedback stays 0, zero gradient — no loss surgery needed). The
+clinical generator below emits the full (B,W,117) tensor with math slots
+dormant; the kernel pads math windows to 117 the same way for the exam.
+
+The 6 dropped labs are the most-missing on real MIMIC train (measured
+2026-08-19): Bilirubin_direct 0.998, Fibrinogen 0.993, TroponinI 0.991,
+Bilirubin_total 0.985, Alkalinephos 0.984, AST 0.984 — they lack the
+chronological density that autoregressive modeling requires.
+
+Clinical semantics (mirrors data_engine/mimic_ingest.py): vitals rhythmic
++ trend with low missingness, labs slow high-missingness, per-feature z
+via TRAIN stats, ffill (causal, no backward fill), mask column, delta =
+hours since last observation (backward-looking, CAPPED at DELTA_CAP, 0 on
+observed slots). Demographics (Age..HospAdmTime) always observed.
 """
 
 from __future__ import annotations
@@ -31,12 +39,22 @@ import numpy as np
 
 W = 14
 DELTA_CAP = 24.0
-LORENZ_SIGMA, LORENZ_RHO, LORENZ_BETA = 10.0, 28.0, 8.0 / 3.0
-LORENZ_DT = 0.02
-LORENZ_STEPS = 2000
 
-K = 39
-FEATURE_NAMES = [
+K_MATH = 6
+K_CLINICAL = 33
+K_SUBJECTS = K_MATH + K_CLINICAL            # 39 heads
+D_IN = K_SUBJECTS * 3                       # 117 input channels
+HEAD_OFFSET_CLINICAL = K_MATH               # clinical heads start at 6
+CLINICAL_SLOT = HEAD_OFFSET_CLINICAL * 3    # clinical triplets start at 18
+
+# The 6 most-missing labs on real MIMIC train (>= 98.4% missing) — cut so
+# the math sub-grid gets heads 0..5 without growing the model.
+DROP_6_LABS = {
+    "AST", "Alkalinephos", "Bilirubin_direct", "Bilirubin_total",
+    "TroponinI", "Fibrinogen",
+}
+
+FEATURE_NAMES_ALL = [
     "HR", "O2Sat", "Temp", "SBP", "MAP", "DBP", "Resp", "EtCO2",
     "BaseExcess", "HCO3", "FiO2", "pH", "PaCO2", "SaO2", "AST", "BUN",
     "Alkalinephos", "Calcium", "Chloride", "Creatinine", "Bilirubin_direct",
@@ -45,81 +63,25 @@ FEATURE_NAMES = [
     "Fibrinogen", "Platelets", "Age", "Gender", "Unit1", "Unit2",
     "HospAdmTime",
 ]
+FEATURE_NAMES = [n for n in FEATURE_NAMES_ALL if n not in DROP_6_LABS]
+assert len(FEATURE_NAMES) == K_CLINICAL
+
 VITALS = {"HR", "O2Sat", "Temp", "SBP", "MAP", "DBP", "Resp", "EtCO2",
           "FiO2", "pH", "SaO2", "Age", "Gender", "Unit1", "Unit2"}
-DEMOGRAPHICS_FROM = 34  # Age .. HospAdmTime are static, always observed
+DEMOGRAPHICS_FROM = FEATURE_NAMES.index("Age")  # 28 — always observed
 
 
 def _rng(seed: int) -> np.random.Generator:
     return np.random.default_rng(seed)
 
 
-def lorenz_x(g: np.random.Generator, n: int = LORENZ_STEPS,
-             dt: float = LORENZ_DT) -> np.ndarray:
-    s, r, b = LORENZ_SIGMA, LORENZ_RHO, LORENZ_BETA
-    x, y, z = 1.0 + g.normal(0, 0.05, 3)
-    xs = np.empty(n)
-    for i in range(n):
-        xs[i] = x
-
-        def f(xv, yv, zv):
-            return (s * (yv - xv), xv * (r - zv) - yv, xv * yv - b * zv)
-
-        k1 = f(x, y, z)
-        k2 = f(x + dt * k1[0] / 2, y + dt * k1[1] / 2, z + dt * k1[2] / 2)
-        k3 = f(x + dt * k2[0] / 2, y + dt * k2[1] / 2, z + dt * k2[2] / 2)
-        k4 = f(x + dt * k3[0], y + dt * k3[1], z + dt * k3[2])
-        x += dt * (k1[0] + 2 * k2[0] + 2 * k3[0] + k4[0]) / 6
-        y += dt * (k1[1] + 2 * k2[1] + 2 * k3[1] + k4[1]) / 6
-        z += dt * (k1[2] + 2 * k2[2] + 2 * k3[2] + k4[2]) / 6
-    return xs
-
-
-def continuum(g: np.random.Generator) -> np.ndarray:
-    """One 256-step stay of the 6 math channels (sine..lorenz)."""
-    V = np.zeros((256, 6))
-    t = np.arange(256)
-    freqs = g.uniform(0.02, 0.08, 2)
-    phases = g.uniform(0, 2 * np.pi, 2)
-    V[:, 0] = np.sin(freqs[0] * t + phases[0])
-    V[:, 1] = np.cos(freqs[1] * t + phases[1])
-    V[:, 2] = 2.0 * np.exp(-t / g.uniform(20, 90)) + g.uniform(0, 0.02)
-    for _ in range(int(g.integers(1, 4))):
-        a = int(g.integers(1, 251))
-        V[a:, 3] = g.uniform(-0.9, 0.9)
-    mid = int(g.integers(1, 251))
-    V[:, 4] = g.uniform(-1.0, 1.0) / (1.0 + np.exp(-(t - mid) / 12.0))
-    idx = int(g.integers(0, LORENZ_STEPS - 256))
-    V[:, 5] = lorenz_x(g)[idx: idx + 256]
-    return V
-
-
-def exam_windows(n_windows: int, seed: int) -> tuple[np.ndarray, list[int]]:
-    """(B, W, 3) value/mask/delta windows, one KIND per window + kind list.
-
-    Each window is a single math channel (channel = kind index); the B
-    rows cycle through the 6 kinds deterministically so every kind gets
-    ~n_windows/6 windows. Mask column = per-position observation flag
-    drawn in (DROP_LO, DROP_HI) independently; delta = 0 (single channel,
-    no feature structure to track).
-    """
-    g = _rng(seed)
-    X = np.zeros((n_windows, W, 3), dtype=np.float32)
-    kinds = []
-    for i in range(n_windows):
-        kind = i % 6
-        kinds.append(kind)
-        V = continuum(_rng(int(g.integers(0, 2 ** 31))))
-        start = int(g.integers(0, 256 - W))
-        X[i, :, 0] = V[start: start + W, kind]
-        X[i, :, 1] = g.uniform(0.30, 0.70, W) > 0.5
-    return X, kinds
-
-
 def clinical_stay(g: np.random.Generator) -> np.ndarray:
-    """One 168-step stay of 39 features (vitals rhythmic, labs slow)."""
+    """One 168-step stay of the 33 clinical features (vitals rhythmic,
+    labs slow). Values are z-scored on the full cohort (train stats) in
+    the real pipeline; here they are synthesized already standardized.
+    """
     T = 168
-    V = np.zeros((T, K))
+    V = np.zeros((T, K_CLINICAL))
     t = np.arange(T)
     for i, name in enumerate(FEATURE_NAMES):
         if name in VITALS:
@@ -139,8 +101,11 @@ def clinical_stay(g: np.random.Generator) -> np.ndarray:
 
 
 def clinical_windows(n_stays: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(X, Y, M): X (B, W, K*3) triplets, Y (B, W, K) true values,
-    M (B, W, K) observation flags (1 = observed).
+    """(X, Y, M): X (B, W, 117) sub-grid triplets, Y (B, W, 39) true
+    values, M (B, W, 39) observation flags (1 = observed).
+
+    Math channels 0:18 are DORMANT (value 0, mask 1, delta 0) so the
+    clinical loss grades heads 6-38 only by construction.
     """
     g = _rng(seed)
     X, Y, M = [], [], []
@@ -152,10 +117,10 @@ def clinical_windows(n_stays: int, seed: int) -> tuple[np.ndarray, np.ndarray, n
             start = int(g.integers(0, T - W))
             win = V[start: start + W]
             drop = g.uniform(0.15, 0.75)
-            mask = (g.random((W, K)) > drop).astype(np.float32)
+            mask = (g.random((W, K_CLINICAL)) > drop).astype(np.float32)
             mask[:, DEMOGRAPHICS_FROM:] = 1.0
             ff = win.copy()
-            for k in range(K):
+            for k in range(K_CLINICAL):
                 last = None
                 for tt in range(W):
                     if mask[tt, k] > 0.5:
@@ -165,7 +130,7 @@ def clinical_windows(n_stays: int, seed: int) -> tuple[np.ndarray, np.ndarray, n
                     else:
                         ff[tt, k] = last
             delta = np.zeros_like(win)
-            for k in range(K):
+            for k in range(K_CLINICAL):
                 last_obs = -1
                 for tt in range(W):
                     if mask[tt, k] > 0.5:
@@ -174,18 +139,52 @@ def clinical_windows(n_stays: int, seed: int) -> tuple[np.ndarray, np.ndarray, n
                         delta[tt, k] = min(tt - last_obs, DELTA_CAP)
                     else:
                         delta[tt, k] = DELTA_CAP
-            X.append(np.stack([ff, mask, delta], axis=-1)
-                     .reshape(W, K * 3).astype(np.float32))
-            Y.append(win.astype(np.float32))
-            M.append(mask)
+            # sub-grid assembly: math slots dormant, clinical at 18:117
+            x = np.zeros((W, D_IN), dtype=np.float32)
+            x[:, 0::3] = 0.0            # math value
+            x[:, 1::3] = 1.0            # math mask (dormant = observed)
+            x[:, 2::3] = 0.0            # math delta
+            x[:, CLINICAL_SLOT + 0::3] = ff
+            x[:, CLINICAL_SLOT + 1::3] = mask
+            x[:, CLINICAL_SLOT + 2::3] = delta
+            y = np.zeros((W, K_SUBJECTS), dtype=np.float32)
+            y[:, HEAD_OFFSET_CLINICAL:] = win
+            m = np.zeros((W, K_SUBJECTS), dtype=np.float32)
+            m[:, HEAD_OFFSET_CLINICAL:] = mask
+            m[:, :HEAD_OFFSET_CLINICAL] = 1.0
+            X.append(x)
+            Y.append(y)
+            M.append(m)
     return np.stack(X), np.stack(Y), np.stack(M)
 
 
-def masked_r2(pred: np.ndarray, target: np.ndarray,
-              drop_mask: np.ndarray) -> float:
-    """R2 over dropped slots only (drop_mask = 1 - mask)."""
-    num = ((pred - target) ** 2 * drop_mask).sum()
-    den = ((target - target.mean(axis=1, keepdims=True)) ** 2 * drop_mask).sum()
-    return float(1.0 - num / max(den, 1e-9))
+def embed_math_exam(X3: np.ndarray, kinds: np.ndarray,
+                    total_dim: int = D_IN) -> np.ndarray:
+    """(B, W, 3) [value, mask, delta] math windows -> (B, W, 117) grid.
+
+    Dormant-slot protocol: every triplet starts dormant (value=0, mask=1,
+    delta=0); each row's OWN kind triplet (kinds[b] in 0..5) is then
+    overwritten with that window's [value, mask, delta] — the other 5 math
+    kinds and all 33 clinical triplets stay hard-masked, so the router
+    allocates them zero bandwidth and the hard copy pins their heads to 0.
+    kinds[b] selects the triplet (value, mask, delta) at columns
+    (3*kind, 3*kind+1, 3*kind+2).
+    """
+    B, Wn, _ = X3.shape
+    kinds = np.asarray(kinds, dtype=np.int64)
+    if kinds.ndim != 1 or len(kinds) != B:
+        raise ValueError(f"kinds must be 1-D length {B}, got {kinds.shape}")
+    if kinds.min() < 0 or kinds.max() >= K_MATH:
+        raise ValueError(f"kinds out of math range 0..{K_MATH - 1}: "
+                         f"{kinds.min()}..{kinds.max()}")
+    grid = np.zeros((B, Wn, total_dim), dtype=np.float32)
+    grid[:, :, 1::3] = 1.0                      # dormant: mask=1, value=0, delta=0
+    rows = np.arange(B)
+    k3 = kinds * 3
+    grid[rows, :, k3] = X3[:, :, 0]             # value
+    grid[rows, :, k3 + 1] = X3[:, :, 1]         # mask
+    grid[rows, :, k3 + 2] = X3[:, :, 2]         # delta
+    return grid
+
 
 # <<< VENDOR (mimic_contract) — do not edit outside the reference module

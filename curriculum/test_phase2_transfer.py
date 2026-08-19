@@ -4,8 +4,9 @@ import numpy as np
 import pytest
 
 from curriculum.phase2_transfer import (
-    TRANSFER_KEYS, dims_for_phase2, plan_transfer, risk_weights,
-    risk_weighted_fidelity, split_transfer_keys, transferable,
+    COLUMN_COPY_SPEC, TRANSFER_KEYS, dims_for_phase2, partial_key,
+    plan_transfer, risk_weights, risk_weighted_fidelity, split_transfer_keys,
+    transferable,
 )
 
 
@@ -17,58 +18,61 @@ def _fake_state(shape_map):
             out[k] = np.zeros(shape)
     out["gru.weight_ih_l0"] = np.zeros(shape_map["gru.weight_ih_l0"])
     out["decode_cell.weight_ih"] = np.zeros(shape_map["decode_cell.weight_ih"])
-    out["heads.0.weight"] = np.zeros((1, 192))
-    out["heads.0.bias"] = np.zeros((1,))
-    out["heads.1.weight"] = np.zeros((1, 192))
-    out["heads.1.bias"] = np.zeros((1,))
-    out["heads.2.weight"] = np.zeros((1, 192))
-    out["heads.2.bias"] = np.zeros((1,))
-    out["heads.3.weight"] = np.zeros((1, 192))
-    out["heads.3.bias"] = np.zeros((1,))
-    out["heads.4.weight"] = np.zeros((1, 192))
-    out["heads.4.bias"] = np.zeros((1,))
-    out["heads.5.weight"] = np.zeros((1, 192))
-    out["heads.5.bias"] = np.zeros((1,))
     return out
-
-
-class _A:
-    shape = (0,)
-
-    def __init__(self, shape):
-        self.shape = tuple(shape)
 
 
 def test_transfer_keys_partition_phase1_geometry():
     # Phase-1 state dict: d_in=18, K=6 heads
     p1 = dims_for_phase2(k_subjects=6, d_in=18)
-    p1["heads.0.weight"] = (1, 192)
-    p1["heads.0.bias"] = (1,)
+    p1["gru.weight_ih_l0"] = (576, 18)
+    p1["decode_cell.weight_ih"] = (576, 88)
     state = _fake_state(p1)
-    copy_, reinit = plan_transfer(state, k_subjects=39, d_in=117)
-    assert set(copy_) == (TRANSFER_KEYS - {"gru.weight_ih_l0",
-                                           "decode_cell.weight_ih"})
-    # input projections + all 6 phase-1 heads must re-init
-    assert "gru.weight_ih_l0" in reinit
-    assert "decode_cell.weight_ih" in reinit
-    assert all(k.startswith("heads.") for k in reinit
-               if k.startswith("heads."))
-    assert len(reinit) == 2 + 12  # 2 input proj + 6 heads x {weight,bias}
+    full, partial, reinit = plan_transfer(state, k_subjects=39, d_in=117)
+    # every recurrent/routing key + the 6 math heads copy whole
+    assert set(full) == (TRANSFER_KEYS - {"gru.weight_ih_l0",
+                                          "decode_cell.weight_ih"})
+    # the two input projections are partial-column copies, NOT reinit
+    assert set(partial) == {"gru.weight_ih_l0", "decode_cell.weight_ih"}
+    # nothing leaks into reinit: the Phase-1 dict has no other keys and
+    # heads.6..38 do not exist in it at all (math heads are PERMANENT)
+    assert reinit == []
 
 
 def test_transferable_shape_gate():
     tgt = dims_for_phase2()
-    assert transferable("scorer.weight", (100, 192), tgt, 39)
-    assert not transferable("gru.weight_ih_l0", (576, 18), tgt, 39)
-    assert not transferable("heads.0.weight", (1, 192), tgt, 39)
-    assert not transferable("unknown.key", (1,), tgt, 39)
+    assert transferable("scorer.weight", (100, 192), tgt)
+    assert not transferable("gru.weight_ih_l0", (576, 18), tgt)
+    assert transferable("heads.0.weight", (1, 192), tgt)   # permanent math head
+    assert not transferable("heads.6.weight", (1, 192), tgt)  # clinical: new
+    assert not transferable("unknown.key", (1,), tgt)
 
 
 def test_split_transfer_keys_names_only():
-    sd = {"scorer.weight": None, "gru.weight_ih_l0": None}
+    sd = {"scorer.weight": None, "gru.weight_ih_l0": None,
+          "heads.5.bias": None}
     t, r = split_transfer_keys(sd)
-    assert t == ["scorer.weight"]
+    assert t == ["heads.5.bias", "scorer.weight"]
     assert r == ["gru.weight_ih_l0"]
+
+
+def test_column_copy_spec_is_well_formed():
+    # every (tgt_lo, tgt_hi, src_lo, src_hi) must be ordered and sane
+    for key, blocks in COLUMN_COPY_SPEC.items():
+        assert isinstance(blocks, list) and blocks
+        for lo, hi, slo, shi in blocks:
+            assert 0 <= lo < hi
+            assert 0 <= slo < shi
+    # the pooled block must land on the Phase-2 pooled position
+    blocks = COLUMN_COPY_SPEC["decode_cell.weight_ih"]
+    assert (117, 181, 18, 82) in blocks
+    assert (181, 187, 82, 88) in blocks
+
+
+def test_partial_key_detects_spec():
+    assert partial_key("gru.weight_ih_l0")
+    assert partial_key("decode_cell.weight_ih")
+    assert not partial_key("scorer.weight")
+    assert not partial_key("heads.0.weight")
 
 
 def test_risk_weights_flags_volatile_feature():

@@ -114,12 +114,22 @@ class MathSchoolGrid(nn.Module):
 
 W = 14
 DELTA_CAP = 24.0
-LORENZ_SIGMA, LORENZ_RHO, LORENZ_BETA = 10.0, 28.0, 8.0 / 3.0
-LORENZ_DT = 0.02
-LORENZ_STEPS = 2000
 
-K = 39
-FEATURE_NAMES = [
+K_MATH = 6
+K_CLINICAL = 33
+K_SUBJECTS = K_MATH + K_CLINICAL            # 39 heads
+D_IN = K_SUBJECTS * 3                       # 117 input channels
+HEAD_OFFSET_CLINICAL = K_MATH               # clinical heads start at 6
+CLINICAL_SLOT = HEAD_OFFSET_CLINICAL * 3    # clinical triplets start at 18
+
+# The 6 most-missing labs on real MIMIC train (>= 98.4% missing) — cut so
+# the math sub-grid gets heads 0..5 without growing the model.
+DROP_6_LABS = {
+    "AST", "Alkalinephos", "Bilirubin_direct", "Bilirubin_total",
+    "TroponinI", "Fibrinogen",
+}
+
+FEATURE_NAMES_ALL = [
     "HR", "O2Sat", "Temp", "SBP", "MAP", "DBP", "Resp", "EtCO2",
     "BaseExcess", "HCO3", "FiO2", "pH", "PaCO2", "SaO2", "AST", "BUN",
     "Alkalinephos", "Calcium", "Chloride", "Creatinine", "Bilirubin_direct",
@@ -128,13 +138,136 @@ FEATURE_NAMES = [
     "Fibrinogen", "Platelets", "Age", "Gender", "Unit1", "Unit2",
     "HospAdmTime",
 ]
+FEATURE_NAMES = [n for n in FEATURE_NAMES_ALL if n not in DROP_6_LABS]
+assert len(FEATURE_NAMES) == K_CLINICAL
+
 VITALS = {"HR", "O2Sat", "Temp", "SBP", "MAP", "DBP", "Resp", "EtCO2",
           "FiO2", "pH", "SaO2", "Age", "Gender", "Unit1", "Unit2"}
-DEMOGRAPHICS_FROM = 34  # Age .. HospAdmTime are static, always observed
+DEMOGRAPHICS_FROM = FEATURE_NAMES.index("Age")  # 28 — always observed
 
 
 def _rng(seed: int) -> np.random.Generator:
     return np.random.default_rng(seed)
+
+
+def clinical_stay(g: np.random.Generator) -> np.ndarray:
+    """One 168-step stay of the 33 clinical features (vitals rhythmic,
+    labs slow). Values are z-scored on the full cohort (train stats) in
+    the real pipeline; here they are synthesized already standardized.
+    """
+    T = 168
+    V = np.zeros((T, K_CLINICAL))
+    t = np.arange(T)
+    for i, name in enumerate(FEATURE_NAMES):
+        if name in VITALS:
+            base = g.normal(0, 1)
+            amp = g.uniform(0.15, 0.5)
+            freq = g.uniform(0.02, 0.10)
+            trend = g.normal(0, 0.6) * np.linspace(0, 1, T)
+            V[:, i] = base + amp * np.sin(freq * t + g.uniform(0, 6.28)) \
+                + trend
+        else:
+            level = g.normal(0, 1)
+            drift = g.uniform(0.005, 0.02)
+            V[:, i] = level + g.normal(0, 0.15) * np.sin(drift * t
+                                                         + g.uniform(0, 6.28))
+            V[:, i] = np.clip(V[:, i], -4, 4)
+    return V
+
+
+def clinical_windows(n_stays: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(X, Y, M): X (B, W, 117) sub-grid triplets, Y (B, W, 39) true
+    values, M (B, W, 39) observation flags (1 = observed).
+
+    Math channels 0:18 are DORMANT (value 0, mask 1, delta 0) so the
+    clinical loss grades heads 6-38 only by construction.
+    """
+    g = _rng(seed)
+    X, Y, M = [], [], []
+    for stay in range(n_stays):
+        V = clinical_stay(_rng(int(g.integers(0, 2 ** 31))))
+        T = V.shape[0]
+        n_win = min(24, max(1, (T - W) // 2))
+        for _ in range(n_win):
+            start = int(g.integers(0, T - W))
+            win = V[start: start + W]
+            drop = g.uniform(0.15, 0.75)
+            mask = (g.random((W, K_CLINICAL)) > drop).astype(np.float32)
+            mask[:, DEMOGRAPHICS_FROM:] = 1.0
+            ff = win.copy()
+            for k in range(K_CLINICAL):
+                last = None
+                for tt in range(W):
+                    if mask[tt, k] > 0.5:
+                        last = win[tt, k]
+                    elif last is None:
+                        last = win[0, k]
+                    else:
+                        ff[tt, k] = last
+            delta = np.zeros_like(win)
+            for k in range(K_CLINICAL):
+                last_obs = -1
+                for tt in range(W):
+                    if mask[tt, k] > 0.5:
+                        last_obs = tt
+                    elif last_obs >= 0:
+                        delta[tt, k] = min(tt - last_obs, DELTA_CAP)
+                    else:
+                        delta[tt, k] = DELTA_CAP
+            # sub-grid assembly: math slots dormant, clinical at 18:117
+            x = np.zeros((W, D_IN), dtype=np.float32)
+            x[:, 0::3] = 0.0            # math value
+            x[:, 1::3] = 1.0            # math mask (dormant = observed)
+            x[:, 2::3] = 0.0            # math delta
+            x[:, CLINICAL_SLOT + 0::3] = ff
+            x[:, CLINICAL_SLOT + 1::3] = mask
+            x[:, CLINICAL_SLOT + 2::3] = delta
+            y = np.zeros((W, K_SUBJECTS), dtype=np.float32)
+            y[:, HEAD_OFFSET_CLINICAL:] = win
+            m = np.zeros((W, K_SUBJECTS), dtype=np.float32)
+            m[:, HEAD_OFFSET_CLINICAL:] = mask
+            m[:, :HEAD_OFFSET_CLINICAL] = 1.0
+            X.append(x)
+            Y.append(y)
+            M.append(m)
+    return np.stack(X), np.stack(Y), np.stack(M)
+
+
+def embed_math_exam(X3: np.ndarray, kinds: np.ndarray,
+                    total_dim: int = D_IN) -> np.ndarray:
+    """(B, W, 3) [value, mask, delta] math windows -> (B, W, 117) grid.
+
+    Dormant-slot protocol: every triplet starts dormant (value=0, mask=1,
+    delta=0); each row's OWN kind triplet (kinds[b] in 0..5) is then
+    overwritten with that window's [value, mask, delta] — the other 5 math
+    kinds and all 33 clinical triplets stay hard-masked, so the router
+    allocates them zero bandwidth and the hard copy pins their heads to 0.
+    kinds[b] selects the triplet (value, mask, delta) at columns
+    (3*kind, 3*kind+1, 3*kind+2).
+    """
+    B, Wn, _ = X3.shape
+    kinds = np.asarray(kinds, dtype=np.int64)
+    if kinds.ndim != 1 or len(kinds) != B:
+        raise ValueError(f"kinds must be 1-D length {B}, got {kinds.shape}")
+    if kinds.min() < 0 or kinds.max() >= K_MATH:
+        raise ValueError(f"kinds out of math range 0..{K_MATH - 1}: "
+                         f"{kinds.min()}..{kinds.max()}")
+    grid = np.zeros((B, Wn, total_dim), dtype=np.float32)
+    grid[:, :, 1::3] = 1.0                      # dormant: mask=1, value=0, delta=0
+    rows = np.arange(B)
+    k3 = kinds * 3
+    grid[rows, :, k3] = X3[:, :, 0]             # value
+    grid[rows, :, k3 + 1] = X3[:, :, 1]         # mask
+    grid[rows, :, k3 + 2] = X3[:, :, 2]         # delta
+    return grid
+
+
+# <<< VENDOR (mimic_contract) — do not edit outside the reference module
+# ---------------------------- math exam generators (exam machinery)
+
+LORENZ_SIGMA, LORENZ_RHO, LORENZ_BETA = 10.0, 28.0, 8.0 / 3.0
+LORENZ_DT = 0.02
+LORENZ_STEPS = 2000
 
 
 def lorenz_x(g: np.random.Generator, n: int = LORENZ_STEPS,
@@ -178,13 +311,13 @@ def continuum(g: np.random.Generator) -> np.ndarray:
 
 
 def exam_windows(n_windows: int, seed: int) -> tuple[np.ndarray, list[int]]:
-    """(B, W, 3) value/mask/delta windows, one KIND per window + kind list.
+    """(B, W, 3) [value, mask, delta] windows, one KIND per row.
 
-    Each window is a single math channel (channel = kind index); the B
-    rows cycle through the 6 kinds deterministically so every kind gets
+    Rows cycle through the 6 kinds deterministically so every kind gets
     ~n_windows/6 windows. Mask column = per-position observation flag
     drawn in (DROP_LO, DROP_HI) independently; delta = 0 (single channel,
-    no feature structure to track).
+    no feature structure to track). embed_math_exam ports these into the
+    (B, W, 117) grid at the row's own kind triplet.
     """
     g = _rng(seed)
     X = np.zeros((n_windows, W, 3), dtype=np.float32)
@@ -199,79 +332,6 @@ def exam_windows(n_windows: int, seed: int) -> tuple[np.ndarray, list[int]]:
     return X, kinds
 
 
-def clinical_stay(g: np.random.Generator) -> np.ndarray:
-    """One 168-step stay of 39 features (vitals rhythmic, labs slow)."""
-    T = 168
-    V = np.zeros((T, K))
-    t = np.arange(T)
-    for i, name in enumerate(FEATURE_NAMES):
-        if name in VITALS:
-            base = g.normal(0, 1)
-            amp = g.uniform(0.15, 0.5)
-            freq = g.uniform(0.02, 0.10)
-            trend = g.normal(0, 0.6) * np.linspace(0, 1, T)
-            V[:, i] = base + amp * np.sin(freq * t + g.uniform(0, 6.28)) \
-                + trend
-        else:
-            level = g.normal(0, 1)
-            drift = g.uniform(0.005, 0.02)
-            V[:, i] = level + g.normal(0, 0.15) * np.sin(drift * t
-                                                         + g.uniform(0, 6.28))
-            V[:, i] = np.clip(V[:, i], -4, 4)
-    return V
-
-
-def clinical_windows(n_stays: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(X, Y, M): X (B, W, K*3) triplets, Y (B, W, K) true values,
-    M (B, W, K) observation flags (1 = observed).
-    """
-    g = _rng(seed)
-    X, Y, M = [], [], []
-    for stay in range(n_stays):
-        V = clinical_stay(_rng(int(g.integers(0, 2 ** 31))))
-        T = V.shape[0]
-        n_win = min(24, max(1, (T - W) // 2))
-        for _ in range(n_win):
-            start = int(g.integers(0, T - W))
-            win = V[start: start + W]
-            drop = g.uniform(0.15, 0.75)
-            mask = (g.random((W, K)) > drop).astype(np.float32)
-            mask[:, DEMOGRAPHICS_FROM:] = 1.0
-            ff = win.copy()
-            for k in range(K):
-                last = None
-                for tt in range(W):
-                    if mask[tt, k] > 0.5:
-                        last = win[tt, k]
-                    elif last is None:
-                        last = win[0, k]
-                    else:
-                        ff[tt, k] = last
-            delta = np.zeros_like(win)
-            for k in range(K):
-                last_obs = -1
-                for tt in range(W):
-                    if mask[tt, k] > 0.5:
-                        last_obs = tt
-                    elif last_obs >= 0:
-                        delta[tt, k] = min(tt - last_obs, DELTA_CAP)
-                    else:
-                        delta[tt, k] = DELTA_CAP
-            X.append(np.stack([ff, mask, delta], axis=-1)
-                     .reshape(W, K * 3).astype(np.float32))
-            Y.append(win.astype(np.float32))
-            M.append(mask)
-    return np.stack(X), np.stack(Y), np.stack(M)
-
-
-def masked_r2(pred: np.ndarray, target: np.ndarray,
-              drop_mask: np.ndarray) -> float:
-    """R2 over dropped slots only (drop_mask = 1 - mask)."""
-    num = ((pred - target) ** 2 * drop_mask).sum()
-    den = ((target - target.mean(axis=1, keepdims=True)) ** 2 * drop_mask).sum()
-    return float(1.0 - num / max(den, 1e-9))
-
-# <<< VENDOR (mimic_contract) — do not edit outside the reference module
 # ---------------------------- checkpoint discovery
 
 def discover_input(name):
@@ -281,37 +341,62 @@ def discover_input(name):
             return root
     raise FileNotFoundError(f"dataset {name} not found under {base}")
 
+# full-tensor copies: recurrent/routing priors + PERMANENT math heads 0..5
 TRANSFER_KEYS = {
     "gru.weight_hh_l0", "gru.bias_ih_l0", "gru.bias_hh_l0",
     "decode_cell.weight_hh", "decode_cell.bias_ih", "decode_cell.bias_hh",
     "scorer.weight", "scorer.bias",
     "cell_block.weight", "cell_block.bias",
 }
+TRANSFER_KEYS = TRANSFER_KEYS | {
+    f"heads.{i}.{s}" for i in range(K_MATH) for s in ("weight", "bias")
+}
+
+# column-block partial copies: (tgt_lo, tgt_hi, src_lo, src_hi) — the math
+# window channels + pooled/prev blocks keep their Phase-1 columns so the
+# transferred machinery stays in-distribution on the math exam.
+COLUMN_COPY_SPEC = {
+    "gru.weight_ih_l0": [(0, 18, 0, 18)],
+    "decode_cell.weight_ih": [
+        (0, 18, 0, 18),
+        (117, 181, 18, 82),
+        (181, 187, 82, 88),
+    ],
+}
 
 
 def load_transfer(ckpt_path, model):
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     sd_model = model.state_dict()
-    copied, skipped = [], []
+    copied, partial_copied, reinit = [], [], []
     for k, v in sd.items():
-        if k in TRANSFER_KEYS and k in sd_model and \
+        if k in COLUMN_COPY_SPEC and k in sd_model:
+            with torch.no_grad():
+                for tlo, thi, slo, shi in COLUMN_COPY_SPEC[k]:
+                    sd_model[k][:, tlo:thi] = v[:, slo:shi]
+            partial_copied.append(k)
+        elif k in TRANSFER_KEYS and k in sd_model and \
                 tuple(sd_model[k].shape) == tuple(v.shape):
             with torch.no_grad():
                 sd_model[k].copy_(v)
             copied.append(k)
         else:
-            skipped.append(k)
+            reinit.append(k)
     model.load_state_dict(sd_model)
     print(f"[transfer] copied {len(copied)} keys: {sorted(copied)}")
-    print(f"[transfer] re-init {len(skipped)} keys: {sorted(skipped)}")
-    return copied, skipped
+    print(f"[transfer] column-copied {len(partial_copied)} keys: "
+          f"{sorted(partial_copied)}")
+    print(f"[transfer] re-init {len(reinit)} keys: {sorted(reinit)}")
+    return copied, partial_copied, reinit
 
 
 def param_groups(model):
-    """Two Adams: transfer priors at 1e-5, everything new at 1e-4."""
+    """Two Adams: transfer priors (incl. column-copied projections) at
+    1e-5, everything new at 1e-4."""
+    slow = TRANSFER_KEYS | set(COLUMN_COPY_SPEC)
     transfer, fresh = [], []
     for k, p in model.named_parameters():
-        (transfer if k in TRANSFER_KEYS else fresh).append(p)
+        (transfer if k in slow else fresh).append(p)
     return [
         {"params": transfer, "lr": LR_TRANSFER},
         {"params": fresh, "lr": LR_NEW},
@@ -341,19 +426,28 @@ def fidelity_loss(pred, target, drop_mask, values, mask):
 # ---------------------------- math exam helpers
 
 def exam_inputs():
-    X, kinds = exam_windows(192, SEED + 2)
+    """(B, W, 117) exam grid via the dormant-slot protocol + kinds."""
+    X3, kinds = exam_windows(192, SEED + 2)
+    X = embed_math_exam(X3, np.asarray(kinds))
     return (torch.tensor(X, dtype=torch.float32),
             torch.tensor(kinds, dtype=torch.long))
 
 
 def exam_loss(model, xb, kinds):
-    """Masked MSE pairing each window with ITS OWN kind head (gather)."""
+    """Masked MSE pairing each window with ITS OWN kind head (gather).
+
+    xb is the (B, W, 117) grid; window b's active triplet lives at
+    columns (3*kinds[b] .. 3*kinds[b]+2) = [value, mask, delta]. The
+    model output has 39 HEAD columns (math heads 0..5 = kind index), so
+    head and triplet indices differ.
+    """
     with torch.no_grad():
         l = model(xb)
-    kind_idx = kinds.view(-1, 1, 1).expand(xb.shape[0], W, 1)
-    pred_k = torch.gather(l, 2, kind_idx)
-    target = xb[:, :, 0:1]
-    dm = 1.0 - xb[:, :, 1:2]
+    head_idx = kinds.view(-1, 1, 1).expand(xb.shape[0], W, 1)
+    k3 = (kinds * 3).view(-1, 1, 1)
+    pred_k = torch.gather(l, 2, head_idx)
+    target = torch.gather(xb, 2, k3)
+    dm = 1.0 - torch.gather(xb, 2, k3 + 1)
     return ((pred_k - target) ** 2 * dm).sum() / max(dm.sum(), 1)
 
 
@@ -366,10 +460,10 @@ def exam_r2(model, xb, kinds):
         if sel.sum() == 0:
             r2[kind] = float("nan")
             continue
-        kind_idx = sel.nonzero().view(-1)
+        # every row in sel has kind ki -> its active triplet is at 3*ki
         p = l[sel][:, :, ki:ki + 1]
-        t = xb[sel][:, :, 0:1]
-        dm = (1.0 - xb[sel][:, :, 1:2])
+        t = xb[sel][:, :, 3 * ki:3 * ki + 1]
+        dm = (1.0 - xb[sel][:, :, 3 * ki + 1:3 * ki + 2])
         num = ((p - t) ** 2 * dm).sum()
         den = ((t - t.mean(dim=(0, 1), keepdim=True)) ** 2 * dm).sum()
         r2[kind] = float(1.0 - num / max(den, 1e-9))
@@ -397,12 +491,16 @@ def main():
     print(f"  train {Xtr.shape[0]} windows, test {Xte.shape[0]}", flush=True)
 
     print("[2/5] transfer init...", flush=True)
-    model = MathSchoolGrid(K * 3, HIDDEN, N_CELLS, K_ACTIVE, K)
+    model = MathSchoolGrid(D_IN, HIDDEN, N_CELLS, K_ACTIVE, K_SUBJECTS)
     ckpt_dir = discover_input("math-school-phase-1-checkpoint")
-    copied, skipped = load_transfer(os.path.join(ckpt_dir, "math_school_s42.pt"), model)
-    if len(copied) != len(TRANSFER_KEYS):
-        raise SystemExit(f"FATAL: expected {len(TRANSFER_KEYS)} transfer keys, "
-                         f"copied {len(copied)}: {copied}")
+    copied, partial_copied, skipped = load_transfer(
+        os.path.join(ckpt_dir, "math_school_s42.pt"), model)
+    if len(copied) != len(TRANSFER_KEYS) or \
+            len(partial_copied) != len(COLUMN_COPY_SPEC):
+        raise SystemExit(
+            f"FATAL: expected {len(TRANSFER_KEYS)} full + "
+            f"{len(COLUMN_COPY_SPEC)} column transfers, got "
+            f"{len(copied)} + {len(partial_copied)}")
     opt = torch.optim.Adam(param_groups(model))
     n_par = sum(p.numel() for p in model.parameters())
     n_tr = sum(p.numel() for g in opt.param_groups for p in g["params"]
@@ -451,10 +549,11 @@ def main():
         pred = model(Xte)
     r2_all = masked_r2_nd(pred, Yte, 1.0 - Mte)
     r2_v, r2_l = [], []
-    for i in range(K):
-        dm = 1.0 - Mte[:, :, i]
-        num = ((pred[:, :, i] - Yte[:, :, i]) ** 2 * dm).sum()
-        den = ((Yte[:, :, i] - Yte[:, :, i].mean()) ** 2 * dm).sum()
+    for i in range(K_CLINICAL):
+        j = i + HEAD_OFFSET_CLINICAL        # clinical head index
+        dm = 1.0 - Mte[:, :, j]
+        num = ((pred[:, :, j] - Yte[:, :, j]) ** 2 * dm).sum()
+        den = ((Yte[:, :, j] - Yte[:, :, j].mean()) ** 2 * dm).sum()
         r2v = float(1.0 - num / max(den, 1e-9))
         (r2_v if FEATURE_NAMES[i] in VITALS else r2_l).append(r2v)
     r2_final = exam_r2(model, Xex, kinds_ex)
@@ -472,6 +571,7 @@ def main():
         "exam_r2_final": r2_final,
         "exam_r2_base": r2_base,
         "transfer_copied": copied,
+        "transfer_column_copied": partial_copied,
         "transfer_reinit": skipped,
         "verdict": "PASS" if ok else "FAIL",
         "seconds": round(time.time() - t0, 1),

@@ -222,6 +222,36 @@ def build_dataset(n_stays: int, seed: int = 0, cap: int = CAP_WINDOWS
     return X, Y, days
 
 
+def build_dataset_masked(n_stays: int, seed: int = 0,
+                         cap: int = CAP_WINDOWS
+                         ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """build_dataset + per-window masks: returns (X, Y, M).
+
+    Window selection is byte-identical to build_dataset (same stay seeds,
+    same cap sampling); M[j] = the stay's mask over window j's span, so
+    masked-R2 grading on dropped slots is exactly the Phase-1 certificate
+    protocol (kernel math_school_train.py build_dataset returns M the same
+    way).
+    """
+    rng = _rng(seed)
+    all_x, all_y, all_m = [], [], []
+    for i in range(n_stays):
+        day = generate_stay(seed=int(rng.integers(0, 2**31)))
+        x, y = _windows_from_stay(day, cap=cap, seed=1000 + i)
+        T, K = day["value"].shape
+        n = (T - W) // SLIDE + 1
+        idx = np.arange(0, n, 1)
+        if cap is not None and len(idx) > cap:
+            r = np.random.default_rng(1000 + i)
+            idx = np.sort(r.choice(idx, size=cap, replace=False))
+        m = np.stack([day["mask"][s * SLIDE: s * SLIDE + W] for s in idx])
+        all_x.append(x)
+        all_y.append(y)
+        all_m.append(m)
+    return (np.concatenate(all_x), np.concatenate(all_y),
+            np.concatenate(all_m))
+
+
 def masked_r2(pred: np.ndarray, target: np.ndarray, mask: np.ndarray) -> float:
     """Per-kind R2 on masked (dropped) positions only.
 

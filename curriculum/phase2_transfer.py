@@ -1,22 +1,33 @@
 """Phase-2 transfer utilities — Physics priors -> clinical tensors (numpy).
 
-Bridges the certified Phase-1 math grid into the MIMIC-IV clinical stem:
+Bridges the certified Phase-1 math grid into the MIMIC-IV clinical stem.
 
-  Stage-1 surface (transferable, same shapes):
-    gru.weight_hh_l0 / bias_ih_l0 / bias_hh_l0   recurrent dynamics
-    decode_cell.weight_hh / bias_ih / bias_hh    mask-decoder recurrence
-    scorer.{weight,bias}                         100-cell routing manifold
-    cell_block.{weight,bias}                     cell feature library
+Sub-grid geometry (user-locked 2026-08-19): the Phase-2 model is ONE grid
+with 39 heads = 6 math (heads 0-5) + 33 clinical (heads 6-38). The math
+heads are PERMANENT — their readouts transfer wholesale.
 
-  Stage-2-only surface (re-initialized, shapes differ):
-    gru.weight_ih_l0      d_in 18 -> 117 (feature semantics differ)
-    decode_cell.weight_ih ctx 88 -> 220 (K 6 -> 39 heads with the great
-    heads.*               per-feature readout, one per FEATURE_NAMES)
+Transfer surface (three kinds):
 
-The recurrent hidden-to-hidden matrices and the whole grid (router +
-cell library) carry the math priors; input projections and per-feature
-readouts must re-learn their semantics. This is the honest low-LR warm
-start: transfer_group gets LR_TRANSFER=1e-5, new_group LR_NEW=1e-4.
+  FULL TENSOR (shapes identical):
+    gru.weight_hh_l0 / biases            recurrent dynamics
+    decode_cell.weight_hh / biases        mask-decoder recurrence
+    scorer.{weight,bias}                  100-cell routing manifold
+    cell_block.{weight,bias}              cell feature library
+    heads.0..5.{weight,bias}              PERMANENT math readouts
+
+  COLUMN BLOCKS (partial copies — REQUIRED for exam baseline parity):
+    gru.weight_ih_l0        [0:18] <- p1 [0:18]   math window channels
+    decode_cell.weight_ih   [0:18]  <- p1 [0:18]   math window channels
+                            [117:181] <- p1 [18:82] pooled latent block
+                            [181:187] <- p1 [82:88] prev math-head block
+    Without these the random clinical input projections would drive the
+    transferred recurrent/scorer machinery out of distribution on math
+    windows and the no-forgetting exam baseline would collapse.
+
+  RE-INIT (fresh, shapes differ / new keys):
+    gru.weight_ih_l0        [18:117]   clinical window columns
+    decode_cell.weight_ih   [18:117], [187:220]   clinical window + prev
+    heads.6..38.{weight,bias}           new clinical readouts
 
 Numpy-only here (this box has no torch): the mapping logic is tested
 against shaped mock tensors; the kernel applies it to real state_dicts.
@@ -34,14 +45,32 @@ TRANSFER_KEYS = {
     "scorer.weight", "scorer.bias",
     "cell_block.weight", "cell_block.bias",
 }
+MATH_HEAD_KEYS = {
+    f"heads.{i}.weight" for i in range(6)
+} | {f"heads.{i}.bias" for i in range(6)}
+TRANSFER_KEYS = TRANSFER_KEYS | MATH_HEAD_KEYS
+
+# (target_key -> [(tgt_lo, tgt_hi, src_lo, src_hi)]); src slices index the
+# Phase-1 tensor (columns), tgt slices index the Phase-2 tensor (columns).
+COLUMN_COPY_SPEC = {
+    "gru.weight_ih_l0": [(0, 18, 0, 18)],
+    "decode_cell.weight_ih": [
+        (0, 18, 0, 18),        # math window channels (same positions)
+        (117, 181, 18, 82),    # pooled latent block (positionally shifted)
+        (181, 187, 82, 88),    # prev math-head block (first 6 heads)
+    ],
+}
+
+K_MATH = 6
+K_CLINICAL = 33
+D_IN = 117
+CLINICAL_SLOT = K_MATH * 3  # 18
+HIDDEN = 192
+N_CELLS = 100
 
 
 def split_transfer_keys(state_dict: dict) -> tuple[list[str], list[str]]:
-    """Partition a checkpoint's keys into (transferable, re-initialized).
-
-    A key is transferable iff it is in TRANSFER_KEYS AND its shape matches
-    the counterpart in the target model dict (target_keys -> shapes).
-    """
+    """Partition a checkpoint's keys into (transferable-named, otherwise)."""
     transfer, reinit = [], []
     for k in sorted(state_dict):
         if k in TRANSFER_KEYS:
@@ -51,30 +80,34 @@ def split_transfer_keys(state_dict: dict) -> tuple[list[str], list[str]]:
     return transfer, reinit
 
 
-def dims_for_phase2(k_subjects: int = 39, d_in: int = 117,
-                    hidden: int = 192, n_cells: int = 100) -> dict[str, tuple]:
+def dims_for_phase2(k_subjects: int = K_MATH + K_CLINICAL,
+                    d_in: int = D_IN) -> dict[str, tuple]:
     """Phase-2 tensor shapes for the MathSchoolGrid architecture."""
-    return {
-        "gru.weight_ih_l0": (3 * hidden, d_in),
-        "gru.weight_hh_l0": (3 * hidden, hidden),
-        "gru.bias_ih_l0": (3 * hidden,),
-        "gru.bias_hh_l0": (3 * hidden,),
-        "decode_cell.weight_ih": (3 * hidden, d_in + 64 + k_subjects),
-        "decode_cell.weight_hh": (3 * hidden, hidden),
-        "decode_cell.bias_ih": (3 * hidden,),
-        "decode_cell.bias_hh": (3 * hidden,),
-        "scorer.weight": (n_cells, hidden),
-        "scorer.bias": (n_cells,),
-        "cell_block.weight": (n_cells * 64, hidden),
-        "cell_block.bias": (n_cells * 64,),
-        "heads.0.weight": (1, hidden),
-        "heads.0.bias": (1,),
+    ctx = d_in + 64 + k_subjects
+    ctx_p1 = 18 + 64 + 6
+    dims = {
+        "gru.weight_ih_l0": (3 * HIDDEN, d_in),
+        "gru.weight_hh_l0": (3 * HIDDEN, HIDDEN),
+        "gru.bias_ih_l0": (3 * HIDDEN,),
+        "gru.bias_hh_l0": (3 * HIDDEN,),
+        "decode_cell.weight_ih": (3 * HIDDEN, ctx),
+        "decode_cell.weight_hh": (3 * HIDDEN, HIDDEN),
+        "decode_cell.bias_ih": (3 * HIDDEN,),
+        "decode_cell.bias_hh": (3 * HIDDEN,),
+        "scorer.weight": (N_CELLS, HIDDEN),
+        "scorer.bias": (N_CELLS,),
+        "cell_block.weight": (N_CELLS * 64, HIDDEN),
+        "cell_block.bias": (N_CELLS * 64,),
     }
+    for i in range(min(k_subjects, K_MATH)):   # permanent math readouts
+        dims[f"heads.{i}.weight"] = (1, HIDDEN)
+        dims[f"heads.{i}.bias"] = (1,)
+    return dims
 
 
 def transferable(state_key: str, state_shape: tuple,
-                 target_shapes: dict, k_subjects: int) -> bool:
-    """True iff state_key can be copied into the Phase-2 model."""
+                 target_shapes: dict) -> bool:
+    """True iff state_key can be copied whole into the Phase-2 model."""
     if state_key not in TRANSFER_KEYS:
         return False
     shape = target_shapes.get(state_key)
@@ -83,23 +116,31 @@ def transferable(state_key: str, state_shape: tuple,
     return tuple(state_shape) == tuple(shape)
 
 
-def plan_transfer(math_state: dict, k_subjects: int = 39,
-                  d_in: int = 117) -> tuple[list[str], list[str]]:
-    """Plan a transfer: ([copy_keys], [reinit_keys]) for a Phase-2 model.
+def partial_key(state_key: str) -> bool:
+    """True iff state_key has a column-block copy spec (partial transfer)."""
+    return state_key in COLUMN_COPY_SPEC
+
+
+def plan_transfer(math_state: dict, k_subjects: int = K_MATH + K_CLINICAL,
+                  d_in: int = D_IN) -> tuple[list[str], list[str], list[str]]:
+    """Plan a transfer: (full_copy, partial_copy, reinit) key lists.
 
     Keys present in the Phase-1 checkpoint but shaped for the Phase-1
-    geometry are re-init candidates even if TRANSFER_KEYS-named (e.g.
-    gru.weight_ih_l0); keys that appear only in the target (heads.*) can
-    never be copied and are simply absent from both lists.
+    geometry are partial or re-init candidates even if TRANSFER_KEYS-
+    named (e.g. gru.weight_ih_l0); keys that appear only in the target
+    (heads.6..38) can never be copied and are simply absent from both
+    lists.
     """
     target = dims_for_phase2(k_subjects=k_subjects, d_in=d_in)
-    copy_keys, reinit_keys = [], []
+    full, partial, reinit = [], [], []
     for k, v in sorted(math_state.items()):
-        if transferable(k, v.shape, target, k_subjects):
-            copy_keys.append(k)
+        if partial_key(k):
+            partial.append(k)
+        elif transferable(k, v.shape, target):
+            full.append(k)
         else:
-            reinit_keys.append(k)
-    return copy_keys, reinit_keys
+            reinit.append(k)
+    return full, partial, reinit
 
 
 def risk_weights(values, mask, drop_weight: float = 3.0):
