@@ -596,37 +596,44 @@ def fidelity_loss(pred, target, drop_mask, values, mask):
 # ---------------------------- math exam helpers
 
 def exam_inputs():
-    """(B, W, 117) exam grid: all 6 math kinds active (Phase-1 parity),
-    clinical triplets dormant via embed_math_block."""
-    X18, _, _ = exam_windows(192, SEED + 2)
+    """(Xb, Y, M) exam triple: embedded (B, W, 117) grid (all 6 math kinds
+    active via embed_math_block, clinical dormant), TRUE values Y (B, W, 6)
+    and observation masks M (B, W, 6) from the CERTIFIED generator.
+
+    The target MUST be Y, not the grid's value channel: build_dataset's
+    value column is FFILLED (carried forward), and at dropped slots the
+    ffill baseline is a stale copy of the last observation — grading
+    against it penalized fast channels (sine/cosine/lorenz) while
+    flattering slow ones (decay/step/sigmoid). Phase-1's masked_r2
+    grades against Yte (true values).
+    """
+    X18, Y, M = exam_windows(192, SEED + 2)
     X = embed_math_block(X18)
-    return torch.tensor(X, dtype=torch.float32)
+    return (torch.tensor(X, dtype=torch.float32),
+            torch.tensor(Y, dtype=torch.float32),
+            torch.tensor(M, dtype=torch.float32))
 
 
-def exam_loss(model, xb):
-    """Masked MSE over math heads 0..5 on their own triplets.
-
-    Phase-1 parity: every window carries all 6 kinds at triplets
-    (3k, 3k+1, 3k+2) = [value, mask, delta]; head k's target is triplet
-    k's value, graded on dropped slots only. Clinical heads are pinned
-    to 0 by the dormant protocol (no gradient, no loss surgery).
+def exam_loss(model, xb, yb, mb):
+    """Masked MSE over math heads 0..5, graded on TRUE values Y at
+    dropped slots only (Phase-1 certificate protocol). Clinical heads
+    are pinned to 0 by the dormant protocol (no gradient, no surgery).
     """
     with torch.no_grad():
         l = model(xb)
     pred_k = l[:, :, :K_MATH]                       # (B, W, 6)
-    target = xb[:, :, 0::3][:, :, :K_MATH]
-    dm = 1.0 - xb[:, :, 1::3][:, :, :K_MATH]
-    return ((pred_k - target) ** 2 * dm).sum() / max(dm.sum(), 1)
+    dm = 1.0 - mb                                    # dropped slots
+    return ((pred_k - yb) ** 2 * dm).sum() / max(dm.sum(), 1)
 
 
-def exam_r2(model, xb):
+def exam_r2(model, xb, yb, mb):
     with torch.no_grad():
         l = model(xb)
     r2 = {}
     for ki, kind in enumerate(EXAM_KINDS):
         p = l[:, :, ki:ki + 1]
-        t = xb[:, :, 3 * ki:3 * ki + 1]
-        dm = (1.0 - xb[:, :, 3 * ki + 1:3 * ki + 2])
+        t = yb[:, :, ki:ki + 1]
+        dm = 1.0 - mb[:, :, ki:ki + 1]
         num = ((p - t) ** 2 * dm).sum()
         den = ((t - t.mean(dim=(0, 1), keepdim=True)) ** 2 * dm).sum()
         r2[kind] = float(1.0 - num / max(den, 1e-9))
@@ -674,8 +681,8 @@ def run_arm(lam, Xtr, Ytr, Mtr, Xte, Yte, Mte, f2, t0):
     print(f"  {n_par:,} params | {n_tr:,} priors @ {LR_TRANSFER} "
           f"| {n_par - n_tr:,} new @ {LR_NEW} | lam {lam:g}", flush=True)
 
-    Xex = exam_inputs()
-    r2_base = exam_r2(model, Xex)
+    Xex, Yex, Mex = exam_inputs()
+    r2_base = exam_r2(model, Xex, Yex, Mex)
     print("  baseline " + " ".join(f"{k} {r2_base[k]:.3f}" for k in EXAM_KINDS),
           flush=True)
 
@@ -692,7 +699,7 @@ def run_arm(lam, Xtr, Ytr, Mtr, Xte, Yte, Mte, f2, t0):
             pred = model(xb)
             loss = fidelity_loss(pred, yb, 1.0 - mb, yb, mb)
             if LAMBDA_MATH > 0:
-                loss = loss + LAMBDA_MATH * exam_loss(model, Xex)
+                loss = loss + LAMBDA_MATH * exam_loss(model, Xex, Yex, Mex)
             if LAMBDA_COST > 0:
                 _, votes = model(xb, return_routing=True)
                 loss = loss + LAMBDA_COST * votes.mean() / N_CELLS
@@ -708,7 +715,7 @@ def run_arm(lam, Xtr, Ytr, Mtr, Xte, Yte, Mte, f2, t0):
             tot += float(loss)
         note = ""
         if (ep + 1) % EXAM_EVERY == 0 or ep == N_EPOCHS - 1:
-            r2 = exam_r2(model, Xex)
+            r2 = exam_r2(model, Xex, Yex, Mex)
             worst = min(v for v in r2.values() if v == v)
             note = " EXAM " + " ".join(f"{k} {v:.3f}" for k, v in r2.items()) \
                 + f" [worst {worst:.3f}]"
@@ -725,7 +732,7 @@ def run_arm(lam, Xtr, Ytr, Mtr, Xte, Yte, Mte, f2, t0):
         den = ((Yte[:, :, j] - Yte[:, :, j].mean()) ** 2 * dm).sum()
         r2v = float(1.0 - num / max(den, 1e-9))
         (r2_v if FEATURE_NAMES[i] in VITALS else r2_l).append(r2v)
-    r2_final = exam_r2(model, Xex)
+    r2_final = exam_r2(model, Xex, Yex, Mex)
     ok = r2_all >= 0.90 and all(v >= EXAM_FLOOR for v in r2_final.values())
     print(f"  clinical masked R2 {r2_all:.4f} | vitals {np.mean(r2_v):.3f} "
           f"labs {np.mean(r2_l):.3f}", flush=True)
