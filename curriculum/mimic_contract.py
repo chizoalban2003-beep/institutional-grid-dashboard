@@ -158,32 +158,24 @@ def clinical_windows(n_stays: int, seed: int) -> tuple[np.ndarray, np.ndarray, n
     return np.stack(X), np.stack(Y), np.stack(M)
 
 
-def embed_math_exam(X3: np.ndarray, kinds: np.ndarray,
-                    total_dim: int = D_IN) -> np.ndarray:
-    """(B, W, 3) [value, mask, delta] math windows -> (B, W, 117) grid.
+def embed_math_block(X18: np.ndarray,
+                     total_dim: int = D_IN) -> np.ndarray:
+    """(B, W, 18) Phase-1 full math windows -> (B, W, 117) grid.
 
-    Dormant-slot protocol: every triplet starts dormant (value=0, mask=1,
-    delta=0); each row's OWN kind triplet (kinds[b] in 0..5) is then
-    overwritten with that window's [value, mask, delta] — the other 5 math
-    kinds and all 33 clinical triplets stay hard-masked, so the router
-    allocates them zero bandwidth and the hard copy pins their heads to 0.
-    kinds[b] selects the triplet (value, mask, delta) at columns
-    (3*kind, 3*kind+1, 3*kind+2).
+    Phase-1 parity exam protocol: the exam grades ALL 6 kinds per window,
+    exactly like the Phase-1 certificate (masked R2 per kind on full
+    multi-kind test windows). X18 carries all kinds' [value, mask, delta]
+    triplets (columns 0..17); they land in the math sub-grid 0:18 and the
+    33 clinical triplets stay dormant (value=0, mask=1, delta=0) so the
+    hard copy pins clinical heads to 0 (zero bandwidth, zero gradient).
     """
-    B, Wn, _ = X3.shape
-    kinds = np.asarray(kinds, dtype=np.int64)
-    if kinds.ndim != 1 or len(kinds) != B:
-        raise ValueError(f"kinds must be 1-D length {B}, got {kinds.shape}")
-    if kinds.min() < 0 or kinds.max() >= K_MATH:
-        raise ValueError(f"kinds out of math range 0..{K_MATH - 1}: "
-                         f"{kinds.min()}..{kinds.max()}")
+    B, Wn, _ = X18.shape
+    if X18.shape[2] != K_MATH * 3:
+        raise ValueError(f"math windows must be (B, W, {K_MATH * 3}), "
+                         f"got {X18.shape}")
     grid = np.zeros((B, Wn, total_dim), dtype=np.float32)
     grid[:, :, 1::3] = 1.0                      # dormant: mask=1, value=0, delta=0
-    rows = np.arange(B)
-    k3 = kinds * 3
-    grid[rows, :, k3] = X3[:, :, 0]             # value
-    grid[rows, :, k3 + 1] = X3[:, :, 1]         # mask
-    grid[rows, :, k3 + 2] = X3[:, :, 2]         # delta
+    grid[:, :, :K_MATH * 3] = X18               # all kinds active (Phase-1 parity)
     return grid
 
 

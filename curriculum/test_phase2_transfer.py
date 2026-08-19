@@ -4,9 +4,9 @@ import numpy as np
 import pytest
 
 from curriculum.phase2_transfer import (
-    COLUMN_COPY_SPEC, TRANSFER_KEYS, dims_for_phase2, partial_key,
-    plan_transfer, risk_weights, risk_weighted_fidelity, split_transfer_keys,
-    transferable,
+    COLUMN_COPY_SPEC, TRANSFER_KEYS, dims_for_phase2, map_fisher_to_phase2,
+    partial_key, plan_transfer, risk_weights, risk_weighted_fidelity,
+    split_transfer_keys, transferable,
 )
 
 
@@ -66,6 +66,42 @@ def test_column_copy_spec_is_well_formed():
     blocks = COLUMN_COPY_SPEC["decode_cell.weight_ih"]
     assert (117, 181, 18, 82) in blocks
     assert (181, 187, 82, 88) in blocks
+
+
+def _fake_fisher_p1():
+    return {
+        "gru.weight_ih_l0": np.zeros((576, 18)) + 0.5,
+        "decode_cell.weight_ih": np.zeros((576, 88)) + 0.25,
+        **{f"heads.{i}.weight": np.zeros((1, 192)) + 0.1
+           for i in range(6)},
+        **{f"heads.{i}.bias": np.zeros((1,)) + 0.1 for i in range(6)},
+    }
+
+
+def test_fisher_map_places_math_columns_only():
+    f2 = map_fisher_to_phase2(_fake_fisher_p1())
+    # gru: math columns carry F, clinical columns FREE (zero)
+    assert f2["gru.weight_ih_l0"].shape == (576, 117)
+    assert np.all(f2["gru.weight_ih_l0"][:, :18] == 0.5)
+    assert np.all(f2["gru.weight_ih_l0"][:, 18:] == 0.0)
+    # decode: only the three column-copy blocks carry F
+    dec = f2["decode_cell.weight_ih"]
+    assert dec.shape == (576, 220)
+    assert np.all(dec[:, 0:18] == 0.25)
+    assert np.all(dec[:, 117:181] == 0.25)
+    assert np.all(dec[:, 181:187] == 0.25)
+    assert np.all(dec[:, 18:117] == 0.0)
+    assert np.all(dec[:, 187:] == 0.0)
+    # heads: full tensors
+    for i in range(6):
+        assert f2[f"heads.{i}.weight"].shape == (1, 192)
+        assert f2[f"heads.{i}.bias"].shape == (1,)
+
+
+def test_fisher_map_blocks_match_column_spec():
+    f2 = map_fisher_to_phase2(_fake_fisher_p1())
+    for tlo, thi, slo, shi in COLUMN_COPY_SPEC["decode_cell.weight_ih"]:
+        assert np.all(f2["decode_cell.weight_ih"][:, tlo:thi] == 0.25)
 
 
 def test_partial_key_detects_spec():

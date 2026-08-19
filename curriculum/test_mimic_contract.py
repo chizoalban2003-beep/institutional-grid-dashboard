@@ -6,7 +6,7 @@ import pytest
 from curriculum.mimic_contract import (
     CLINICAL_SLOT, D_IN, DROP_6_LABS, FEATURE_NAMES, K_CLINICAL,
     K_MATH, K_SUBJECTS, DEMOGRAPHICS_FROM, VITALS, W, clinical_windows,
-    embed_math_exam,
+    embed_math_block,
 )
 
 
@@ -84,51 +84,20 @@ def test_clinical_causal_ffill_no_lookahead():
                     assert abs(v[b, t, k] - last_val) < 1e-6  # causal ffill
 
 
-def _fake_exam(n, seed=0):
-    """(n, W, 3) exam windows with per-row kind cycling 0..5."""
-    g = np.random.default_rng(seed)
-    X3 = np.zeros((n, W, 3), dtype=np.float32)
-    kinds = np.arange(n) % K_MATH
-    X3[:, :, 0] = g.normal(size=(n, W)).astype(np.float32)  # value
-    X3[:, :, 1] = (g.random((n, W)) > 0.5).astype(np.float32)  # mask
-    return X3, kinds
-
-
-def test_embed_math_exam_dormant_elsewhere():
-    X3, kinds = _fake_exam(24)
-    grid = embed_math_exam(X3, kinds)
+def test_embed_math_block_all_kinds_active():
+    rng = np.random.default_rng(0)
+    X18 = rng.normal(size=(24, W, 18)).astype(np.float32)
+    grid = embed_math_block(X18)
     assert grid.shape == (24, W, D_IN)
-    for b in range(24):
-        k = int(kinds[b])
-        lo = 3 * k
-        # active triplet copied verbatim
-        assert np.allclose(grid[b, :, lo:lo + 3], X3[b])
-        # every other triplet stays dormant: value 0, mask 1, delta 0
-        for j in range(K_SUBJECTS):
-            if j == k:
-                continue
-            assert np.all(grid[b, :, 3 * j] == 0.0)
-            assert np.all(grid[b, :, 3 * j + 1] == 1.0)
-            assert np.all(grid[b, :, 3 * j + 2] == 0.0)
+    # math sub-grid carries the full multi-kind window verbatim
+    assert np.allclose(grid[:, :, :18], X18)
+    # clinical triplets dormant: value 0, mask 1, delta 0
+    assert np.all(grid[:, :, CLINICAL_SLOT:][:, :, 0::3] == 0.0)
+    assert np.all(grid[:, :, CLINICAL_SLOT:][:, :, 1::3] == 1.0)
+    assert np.all(grid[:, :, CLINICAL_SLOT:][:, :, 2::3] == 0.0)
 
 
-def test_embed_math_exam_vectorized_per_row_kind():
-    X3, kinds = _fake_exam(12, seed=3)
-    grid = embed_math_exam(X3, kinds)
-    # brute-force reference
-    ref = np.zeros_like(grid)
-    ref[:, :, 1::3] = 1.0
-    for b in range(12):
-        lo = 3 * int(kinds[b])
-        ref[b, :, lo:lo + 3] = X3[b]
-    assert np.array_equal(grid, ref)
-
-
-def test_embed_math_exam_validates_kinds():
-    X3, kinds = _fake_exam(6)
+def test_embed_math_block_validates_shape():
+    rng = np.random.default_rng(1)
     with pytest.raises(ValueError):
-        embed_math_exam(X3, np.arange(5))  # wrong length
-    with pytest.raises(ValueError):
-        embed_math_exam(X3, np.array([6, 0, 0, 0, 0, 0]))  # kind out of range
-    with pytest.raises(ValueError):
-        embed_math_exam(X3, kinds.reshape(6, 1))  # not 1-D
+        embed_math_block(rng.normal(size=(4, W, 3)))  # not 18 channels

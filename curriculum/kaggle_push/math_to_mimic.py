@@ -233,32 +233,24 @@ def clinical_windows(n_stays: int, seed: int) -> tuple[np.ndarray, np.ndarray, n
     return np.stack(X), np.stack(Y), np.stack(M)
 
 
-def embed_math_exam(X3: np.ndarray, kinds: np.ndarray,
-                    total_dim: int = D_IN) -> np.ndarray:
-    """(B, W, 3) [value, mask, delta] math windows -> (B, W, 117) grid.
+def embed_math_block(X18: np.ndarray,
+                     total_dim: int = D_IN) -> np.ndarray:
+    """(B, W, 18) Phase-1 full math windows -> (B, W, 117) grid.
 
-    Dormant-slot protocol: every triplet starts dormant (value=0, mask=1,
-    delta=0); each row's OWN kind triplet (kinds[b] in 0..5) is then
-    overwritten with that window's [value, mask, delta] — the other 5 math
-    kinds and all 33 clinical triplets stay hard-masked, so the router
-    allocates them zero bandwidth and the hard copy pins their heads to 0.
-    kinds[b] selects the triplet (value, mask, delta) at columns
-    (3*kind, 3*kind+1, 3*kind+2).
+    Phase-1 parity exam protocol: the exam grades ALL 6 kinds per window,
+    exactly like the Phase-1 certificate (masked R2 per kind on full
+    multi-kind test windows). X18 carries all kinds' [value, mask, delta]
+    triplets (columns 0..17); they land in the math sub-grid 0:18 and the
+    33 clinical triplets stay dormant (value=0, mask=1, delta=0) so the
+    hard copy pins clinical heads to 0 (zero bandwidth, zero gradient).
     """
-    B, Wn, _ = X3.shape
-    kinds = np.asarray(kinds, dtype=np.int64)
-    if kinds.ndim != 1 or len(kinds) != B:
-        raise ValueError(f"kinds must be 1-D length {B}, got {kinds.shape}")
-    if kinds.min() < 0 or kinds.max() >= K_MATH:
-        raise ValueError(f"kinds out of math range 0..{K_MATH - 1}: "
-                         f"{kinds.min()}..{kinds.max()}")
+    B, Wn, _ = X18.shape
+    if X18.shape[2] != K_MATH * 3:
+        raise ValueError(f"math windows must be (B, W, {K_MATH * 3}), "
+                         f"got {X18.shape}")
     grid = np.zeros((B, Wn, total_dim), dtype=np.float32)
     grid[:, :, 1::3] = 1.0                      # dormant: mask=1, value=0, delta=0
-    rows = np.arange(B)
-    k3 = kinds * 3
-    grid[rows, :, k3] = X3[:, :, 0]             # value
-    grid[rows, :, k3 + 1] = X3[:, :, 1]         # mask
-    grid[rows, :, k3 + 2] = X3[:, :, 2]         # delta
+    grid[:, :, :K_MATH * 3] = X18               # all kinds active (Phase-1 parity)
     return grid
 
 
@@ -310,26 +302,44 @@ def continuum(g: np.random.Generator) -> np.ndarray:
     return V
 
 
-def exam_windows(n_windows: int, seed: int) -> tuple[np.ndarray, list[int]]:
-    """(B, W, 3) [value, mask, delta] windows, one KIND per row.
+def exam_windows(n_windows: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(B, W, 18) Phase-1-parity exam windows (ALL kinds active) + Y, M.
 
-    Rows cycle through the 6 kinds deterministically so every kind gets
-    ~n_windows/6 windows. Mask column = per-position observation flag
-    drawn in (DROP_LO, DROP_HI) independently; delta = 0 (single channel,
-    no feature structure to track). embed_math_exam ports these into the
-    (B, W, 117) grid at the row's own kind triplet.
+    Byte-identical distribution to the Phase-1 certificate protocol:
+    the exam grades every kind on full multi-kind windows (masked R2 on
+    dropped slots), exactly like math_school_train.py's grading exam.
+    The Phase-2 single-kind variant is REFUTED — transferred columns are
+    out-of-distribution with 5 dormant triplets (epoch-0 baseline already
+    failed: step 0.683, lorenz -0.064, sine 0.821).
     """
     g = _rng(seed)
-    X = np.zeros((n_windows, W, 3), dtype=np.float32)
-    kinds = []
+    X, Y, M = [], [], []
     for i in range(n_windows):
-        kind = i % 6
-        kinds.append(kind)
         V = continuum(_rng(int(g.integers(0, 2 ** 31))))
         start = int(g.integers(0, 256 - W))
-        X[i, :, 0] = V[start: start + W, kind]
-        X[i, :, 1] = g.uniform(0.30, 0.70, W) > 0.5
-    return X, kinds
+        win = V[start: start + W]                       # (W, 6) true
+        mask = (g.random((W, 6)) >= g.uniform(0.30, 0.70)).astype(np.float32)
+        ff = win.copy()
+        for k in range(6):
+            last = None
+            for t in range(W):
+                if mask[t, k] > 0.5:
+                    last = win[t, k]
+                elif last is not None:
+                    ff[t, k] = last
+        delta = np.zeros_like(win)
+        for k in range(6):
+            last = -1
+            for t in range(W):
+                if mask[t, k] > 0.5:
+                    last = t
+                elif last >= 0:
+                    delta[t, k] = min(t - last, DELTA_CAP)
+                else:
+                    delta[t, k] = DELTA_CAP
+        x = np.stack([ff, mask, delta], axis=-1).reshape(W, 18).astype(np.float32)
+        X.append(x); Y.append(win.astype(np.float32)); M.append(mask)
+    return np.stack(X), np.stack(Y), np.stack(M)
 
 
 # ---------------------------- checkpoint discovery
@@ -426,44 +436,37 @@ def fidelity_loss(pred, target, drop_mask, values, mask):
 # ---------------------------- math exam helpers
 
 def exam_inputs():
-    """(B, W, 117) exam grid via the dormant-slot protocol + kinds."""
-    X3, kinds = exam_windows(192, SEED + 2)
-    X = embed_math_exam(X3, np.asarray(kinds))
-    return (torch.tensor(X, dtype=torch.float32),
-            torch.tensor(kinds, dtype=torch.long))
+    """(B, W, 117) exam grid: all 6 math kinds active (Phase-1 parity),
+    clinical triplets dormant via embed_math_block."""
+    X18, _, _ = exam_windows(192, SEED + 2)
+    X = embed_math_block(X18)
+    return torch.tensor(X, dtype=torch.float32)
 
 
-def exam_loss(model, xb, kinds):
-    """Masked MSE pairing each window with ITS OWN kind head (gather).
+def exam_loss(model, xb):
+    """Masked MSE over math heads 0..5 on their own triplets.
 
-    xb is the (B, W, 117) grid; window b's active triplet lives at
-    columns (3*kinds[b] .. 3*kinds[b]+2) = [value, mask, delta]. The
-    model output has 39 HEAD columns (math heads 0..5 = kind index), so
-    head and triplet indices differ.
+    Phase-1 parity: every window carries all 6 kinds at triplets
+    (3k, 3k+1, 3k+2) = [value, mask, delta]; head k's target is triplet
+    k's value, graded on dropped slots only. Clinical heads are pinned
+    to 0 by the dormant protocol (no gradient, no loss surgery).
     """
     with torch.no_grad():
         l = model(xb)
-    head_idx = kinds.view(-1, 1, 1).expand(xb.shape[0], W, 1)
-    k3 = (kinds * 3).view(-1, 1, 1)
-    pred_k = torch.gather(l, 2, head_idx)
-    target = torch.gather(xb, 2, k3)
-    dm = 1.0 - torch.gather(xb, 2, k3 + 1)
+    pred_k = l[:, :, :K_MATH]                       # (B, W, 6)
+    target = xb[:, :, 0::3][:, :, :K_MATH]
+    dm = 1.0 - xb[:, :, 1::3][:, :, :K_MATH]
     return ((pred_k - target) ** 2 * dm).sum() / max(dm.sum(), 1)
 
 
-def exam_r2(model, xb, kinds):
+def exam_r2(model, xb):
     with torch.no_grad():
         l = model(xb)
     r2 = {}
     for ki, kind in enumerate(EXAM_KINDS):
-        sel = (kinds == ki)
-        if sel.sum() == 0:
-            r2[kind] = float("nan")
-            continue
-        # every row in sel has kind ki -> its active triplet is at 3*ki
-        p = l[sel][:, :, ki:ki + 1]
-        t = xb[sel][:, :, 3 * ki:3 * ki + 1]
-        dm = (1.0 - xb[sel][:, :, 3 * ki + 1:3 * ki + 2])
+        p = l[:, :, ki:ki + 1]
+        t = xb[:, :, 3 * ki:3 * ki + 1]
+        dm = (1.0 - xb[:, :, 3 * ki + 1:3 * ki + 2])
         num = ((p - t) ** 2 * dm).sum()
         den = ((t - t.mean(dim=(0, 1), keepdim=True)) ** 2 * dm).sum()
         r2[kind] = float(1.0 - num / max(den, 1e-9))
@@ -471,8 +474,15 @@ def exam_r2(model, xb, kinds):
 
 
 def masked_r2_nd(pred, target, drop_mask):
+    """Masked R2 with the GLOBAL mean denominator (Phase-1 semantics).
+
+    The per-window de-mean (dim=1) is REFUTED: near-constant lab channels
+    inside a 14-step window collapse the denominator and explode the
+    pooled R2 (-60.7 in the v3 run while per-feature vitals/labs were
+    0.94/0.91) — a metric artifact, not a model signal.
+    """
     num = ((pred - target) ** 2 * drop_mask).sum()
-    den = ((target - target.mean(dim=1, keepdim=True)) ** 2 * drop_mask).sum()
+    den = ((target - target.mean(dim=(0, 1), keepdim=True)) ** 2 * drop_mask).sum()
     return float(1.0 - num / max(den, 1e-9))
 
 
@@ -509,8 +519,8 @@ def main():
           f"| {n_par - n_tr:,} new @ {LR_NEW}", flush=True)
 
     print("[3/5] math exam baseline...", flush=True)
-    Xex, kinds_ex = exam_inputs()
-    r2_base = exam_r2(model, Xex, kinds_ex)
+    Xex = exam_inputs()
+    r2_base = exam_r2(model, Xex)
     print("  " + " ".join(f"{k} {r2_base[k]:.3f}" for k in EXAM_KINDS), flush=True)
 
     print("[4/5] training...", flush=True)
@@ -526,7 +536,7 @@ def main():
             pred = model(xb)
             loss = fidelity_loss(pred, yb, 1.0 - mb, yb, mb)
             if LAMBDA_MATH > 0:
-                loss = loss + LAMBDA_MATH * exam_loss(model, Xex, kinds_ex)
+                loss = loss + LAMBDA_MATH * exam_loss(model, Xex)
             if LAMBDA_COST > 0:
                 _, votes = model(xb, return_routing=True)
                 loss = loss + LAMBDA_COST * votes.mean() / N_CELLS
@@ -538,7 +548,7 @@ def main():
             tot += float(loss)
         note = ""
         if (ep + 1) % EXAM_EVERY == 0 or ep == N_EPOCHS - 1:
-            r2 = exam_r2(model, Xex, kinds_ex)
+            r2 = exam_r2(model, Xex)
             worst = min(v for v in r2.values() if v == v)
             note = " EXAM " + " ".join(f"{k} {v:.3f}" for k, v in r2.items()) \
                 + f" [worst {worst:.3f}]"
@@ -556,7 +566,7 @@ def main():
         den = ((Yte[:, :, j] - Yte[:, :, j].mean()) ** 2 * dm).sum()
         r2v = float(1.0 - num / max(den, 1e-9))
         (r2_v if FEATURE_NAMES[i] in VITALS else r2_l).append(r2v)
-    r2_final = exam_r2(model, Xex, kinds_ex)
+    r2_final = exam_r2(model, Xex)
     ok = r2_all >= 0.90 and all(v >= EXAM_FLOOR for v in r2_final.values())
     print(f"  clinical masked R2 {r2_all:.4f} | vitals {np.mean(r2_v):.3f} "
           f"labs {np.mean(r2_l):.3f}", flush=True)

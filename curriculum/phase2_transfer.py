@@ -143,6 +143,42 @@ def plan_transfer(math_state: dict, k_subjects: int = K_MATH + K_CLINICAL,
     return full, partial, reinit
 
 
+def map_fisher_to_phase2(f_p1: dict, k_subjects: int = K_MATH + K_CLINICAL,
+                         d_in: int = D_IN) -> dict:
+    """Map Phase-1 diagonal Fisher arrays into Phase-2 tensor shapes.
+
+    The Fisher is computed on the Phase-1 checkpoint (its own geometry:
+    gru.weight_ih (576, 18), decode_cell.weight_ih (576, 88), heads.0..5).
+    EWC in Phase-2 needs F in Phase-2 shapes with ZERO weight on the
+    free clinical columns (only the math sub-grid is protected):
+
+      gru.weight_ih_l0     (576, 117): F[:, 0:18] = p1 F (whole matrix)
+      decode_cell.weight_ih (576, 220): blocks [0:18] <- p1 [0:18],
+                             [117:181] <- p1 [18:82] (pooled),
+                             [181:187] <- p1 [82:88] (prev math heads)
+      heads.0..5           (1, 192)/(1,) identical shapes
+
+    Non-math columns are left at zero — clinical learning is uncharged.
+    """
+    out = {}
+    f_gru = np.asarray(f_p1["gru.weight_ih_l0"], dtype=np.float64)
+    f_dec = np.asarray(f_p1["decode_cell.weight_ih"], dtype=np.float64)
+    gru = np.zeros((3 * HIDDEN, d_in), dtype=np.float64)
+    gru[:, 0:f_gru.shape[1]] = f_gru
+    out["gru.weight_ih_l0"] = gru
+    ctx = d_in + 64 + k_subjects
+    dec = np.zeros((3 * HIDDEN, ctx), dtype=np.float64)
+    for tlo, thi, slo, shi in COLUMN_COPY_SPEC["decode_cell.weight_ih"]:
+        dec[:, tlo:thi] = f_dec[:, slo:shi]
+    out["decode_cell.weight_ih"] = dec
+    for i in range(K_MATH):
+        out[f"heads.{i}.weight"] = np.asarray(
+            f_p1[f"heads.{i}.weight"], dtype=np.float64)
+        out[f"heads.{i}.bias"] = np.asarray(
+            f_p1[f"heads.{i}.bias"], dtype=np.float64)
+    return out
+
+
 def risk_weights(values, mask, drop_weight: float = 3.0):
     """Per-feature risk from observed-slot volatility (pie-chart Risk slice).
 
