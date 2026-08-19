@@ -543,9 +543,14 @@ def exam_loss(model, xb, yb, mb):
     """Masked MSE over math heads 0..5, graded on TRUE values Y at
     dropped slots only (Phase-1 certificate protocol). Clinical heads
     are pinned to 0 by the dormant protocol (no gradient, no surgery).
+
+    v8 FIX (Mechanism d): the pre-v8 versions computed the model under
+    torch.no_grad() — the LAMBDA_MATH anchor contributed a CONSTANT to
+    the loss but ZERO gradient. Clinical fidelity was the only force on
+    the shared core; the math drifted unopposed (v7 forgetting + EWC
+    invisibility). Gradients MUST flow through the anchor.
     """
-    with torch.no_grad():
-        l = model(xb)
+    l = model(xb)
     pred_k = l[:, :, :K_MATH]                       # (B, W, 6)
     dm = 1.0 - mb                                    # dropped slots
     return ((pred_k - yb) ** 2 * dm).sum() / max(dm.sum(), 1)

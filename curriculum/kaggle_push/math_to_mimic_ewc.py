@@ -619,8 +619,7 @@ def exam_loss(model, xb, yb, mb):
     dropped slots only (Phase-1 certificate protocol). Clinical heads
     are pinned to 0 by the dormant protocol (no gradient, no surgery).
     """
-    with torch.no_grad():
-        l = model(xb)
+    l = model(xb)   # v8: gradients MUST flow (dead-anchor bug, see v7)
     pred_k = l[:, :, :K_MATH]                       # (B, W, 6)
     dm = 1.0 - mb                                    # dropped slots
     return ((pred_k - yb) ** 2 * dm).sum() / max(dm.sum(), 1)
