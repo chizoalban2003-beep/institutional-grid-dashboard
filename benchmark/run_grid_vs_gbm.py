@@ -228,13 +228,20 @@ def compute_utility(y_true, y_score, thresholds=None):
 # ─── Grid Model ──────────────────────────────────────────────────────────────
 
 def train_grid(X_train, y_train, X_test, y_test, n_cells=100, k_active=3,
-               n_epochs=25, lr=1e-3, seed=42):
+               n_epochs=50, lr=1e-3, batch_size=512, hidden_dim=128, seed=42):
     """Train the Institutional Grid model.
 
     Input is (N, W, K*3) windows. A GRU temporal encoder reads the
     window (same as the production backend), cells bid on the encoded
     state, top-k cells are routed, and their mean confidence is the
     prediction. Faithful to backend/main.py's GridModel.
+
+    Training upgrades (2026-08-19, benchmark tuning pass):
+      - mini-batches with intra-epoch shuffling (was full-batch: 1 grad
+        step/epoch over all N rows -> the loss plateaued 0.997 -> 0.964)
+      - cosine LR schedule over epochs (Adam + warm restarts-style decay)
+      - wider GRU (hidden_dim 128 vs 64) + dropout on the encoder embedding
+      - scaled cell init (xavier) so the router sees cell signal early
     """
     import torch
     import torch.nn as nn
@@ -243,17 +250,18 @@ def train_grid(X_train, y_train, X_test, y_test, n_cells=100, k_active=3,
     torch.manual_seed(seed)
 
     K3 = X_train.shape[2]
-    hidden_dim = 64
 
     class TemporalEncoder(nn.Module):
         """GRU over the (W, K*3) window → last hidden state."""
         def __init__(self, input_dim, hidden_dim):
             super().__init__()
-            self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
+            self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True,
+                              dropout=0.1)
+            self.drop = nn.Dropout(0.1)
 
         def forward(self, x):
             _, h = self.gru(x)
-            return h[-1]  # (N, hidden_dim)
+            return self.drop(h[-1])  # (N, hidden_dim)
 
     class DifferentiableRouter(nn.Module):
         def __init__(self, n_cells, k, tau=1.0):
@@ -325,6 +333,8 @@ def train_grid(X_train, y_train, X_test, y_test, n_cells=100, k_active=3,
 
     model = GridModel(K3, hidden_dim, n_cells, k_active)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs * int(np.ceil(len(y_train) / batch_size)))
     pos_weight = torch.tensor([(y_train == 0).sum() / max((y_train == 1).sum(), 1)])
 
     X_t = torch.from_numpy(X_train)
@@ -332,19 +342,30 @@ def train_grid(X_train, y_train, X_test, y_test, n_cells=100, k_active=3,
 
     start_time = time.time()
     losses = []
+    n_batches = int(np.ceil(len(y_train) / batch_size))
 
     for epoch in range(n_epochs):
         model.train()
-        optimizer.zero_grad()
-
-        out = model(X_t, governance={'cost_scale': 1.0, 'risk_scale': 1.0})
-        logits = out['predictions'].squeeze()
-        loss = F.binary_cross_entropy_with_logits(
-            logits, y_t, pos_weight=pos_weight
-        )
-        loss.backward()
-        optimizer.step()
-        losses.append(float(loss))
+        # Intra-epoch shuffle (fresh permutation each epoch)
+        perm = torch.randperm(len(y_train))
+        epoch_losses = []
+        for b in range(n_batches):
+            idx = perm[b * batch_size:(b + 1) * batch_size]
+            xb = X_t[idx]
+            yb = y_t[idx]
+            optimizer.zero_grad()
+            out = model(xb, governance={'cost_scale': 1.0, 'risk_scale': 1.0})
+            logits = out['predictions'].squeeze()
+            loss = F.binary_cross_entropy_with_logits(
+                logits, yb, pos_weight=pos_weight
+            )
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            epoch_losses.append(float(loss))
+        losses.append(float(np.mean(epoch_losses)))
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"    epoch {epoch + 1}/{n_epochs} loss {losses[-1]:.4f}", flush=True)
 
     train_time = time.time() - start_time
 
@@ -469,7 +490,9 @@ def run_benchmark(n_stays: int = 200, n_epochs: int = 25, output_dir: str = None
         else:
             print("\n[2/3] Training Institutional Grid...")
         try:
-            grid_result = train_grid(Xw_train, y_train, Xw_test, y_test, n_epochs=n_epochs)
+            grid_result = train_grid(Xw_train, y_train, Xw_test, y_test,
+                                     n_epochs=n_epochs, batch_size=512,
+                                     hidden_dim=128)
             grid_auroc = compute_auroc(y_test, grid_result['test_probs'])
             grid_auprc = compute_auprc(y_test, grid_result['test_probs'])
             grid_util, grid_thr = compute_utility(y_test, grid_result['test_probs'])

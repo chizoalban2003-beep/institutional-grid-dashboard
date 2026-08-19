@@ -225,22 +225,25 @@ def train_gbm(X_train, y_train, X_test, y_test):
 
 
 def train_grid(X_train, y_train, X_test, y_test, n_cells=100, k_active=3,
-               n_epochs=25, lr=1e-3, seed=42):
+               n_epochs=50, lr=1e-3, batch_size=512, hidden_dim=128, seed=42):
     """Institutional Grid: GRU encoder over (N, W, K*3) + top-k MoE cells
-    with pie-chart economy. Mirrors benchmark/run_grid_vs_gbm.train_grid."""
+    with pie-chart economy. Mirrors benchmark/run_grid_vs_gbm.train_grid.
+    Training upgrades: mini-batch + intra-epoch shuffle, cosine LR schedule,
+    wider GRU + dropout."""
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
     torch.manual_seed(seed)
-    hidden_dim = 64
 
     class TemporalEncoder(nn.Module):
         def __init__(self, input_dim, hidden_dim):
             super().__init__()
-            self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True)
+            self.gru = nn.GRU(input_dim, hidden_dim, batch_first=True,
+                              dropout=0.1)
+            self.drop = nn.Dropout(0.1)
         def forward(self, x):
             _, h = self.gru(x)
-            return h[-1]
+            return self.drop(h[-1])
 
     class GridCell(nn.Module):
         def __init__(self, input_dim):
@@ -283,20 +286,32 @@ def train_grid(X_train, y_train, X_test, y_test, n_cells=100, k_active=3,
 
     model = GridModel(K3, hidden_dim, n_cells, k_active)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    n_batches = int(np.ceil(len(y_train) / batch_size))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=n_epochs * n_batches)
     pos_weight = torch.tensor([(y_train == 0).sum() / max((y_train == 1).sum(), 1)])
     X_t = torch.from_numpy(np.ascontiguousarray(X_train))
     y_t = torch.from_numpy(y_train).float()
     start_time = time.time()
     losses = []
-    for _ in range(n_epochs):
+    for epoch in range(n_epochs):
         model.train()
-        optimizer.zero_grad()
-        out = model(X_t, governance={'cost_scale': 1.0, 'risk_scale': 1.0})
-        loss = F.binary_cross_entropy_with_logits(
-            out['predictions'].squeeze(), y_t, pos_weight=pos_weight)
-        loss.backward()
-        optimizer.step()
-        losses.append(float(loss))
+        perm = torch.randperm(len(y_train))
+        epoch_losses = []
+        for b in range(n_batches):
+            idx = perm[b * batch_size:(b + 1) * batch_size]
+            xb = X_t[idx]; yb = y_t[idx]
+            optimizer.zero_grad()
+            out = model(xb, governance={'cost_scale': 1.0, 'risk_scale': 1.0})
+            loss = F.binary_cross_entropy_with_logits(
+                out['predictions'].squeeze(), yb, pos_weight=pos_weight)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            epoch_losses.append(float(loss))
+        losses.append(float(np.mean(epoch_losses)))
+        if epoch == 0 or (epoch + 1) % 10 == 0:
+            print(f"    epoch {epoch + 1}/{n_epochs} loss {losses[-1]:.4f}", flush=True)
     train_time = time.time() - start_time
     model.eval()
     with torch.no_grad():
@@ -337,8 +352,9 @@ def main():
         print(f"PARITY_WARN: GBM AUROC {gbm_auc:.4f} != local 0.9116 — "
               f"generator/prepare drift detected", flush=True)
 
-    print("[4/5] Training Grid (GRU + 100 MoE cells)...", flush=True)
-    grid_res = train_grid(Xw_tr, y_tr, Xw_te, y_te, n_epochs=25)
+    print("[4/5] Training Grid (GRU + 100 MoE cells, batch 512)...", flush=True)
+    grid_res = train_grid(Xw_tr, y_tr, Xw_te, y_te, n_epochs=50,
+                          batch_size=512, hidden_dim=128)
     g_auc = compute_auroc(y_te, grid_res['test_probs'])
     g_ap = compute_auprc(y_te, grid_res['test_probs'])
     g_util, g_thr = compute_utility(y_te, grid_res['test_probs'])
@@ -374,7 +390,7 @@ def main():
                  'auditability': 'black-box: N/A'},
         'grid': {'auroc': g_auc, 'auprc': g_ap, 'utility': g_util,
                   'threshold': g_thr, 'train_time': grid_res['train_time'],
-                  'n_cells': 100, 'n_epochs': 25,
+                  'n_cells': 100, 'n_epochs': 50,
                   'auditability': 'cell bids + pie economy + governance trail',
                   'cell_meta': {'cell_bids': grid_res['cell_bids'],
                                  'pie_weights': grid_res['pie_weights'],
