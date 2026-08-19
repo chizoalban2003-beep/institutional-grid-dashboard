@@ -112,6 +112,26 @@ class MathSchoolGrid(nn.Module):
 
 # >>> VENDOR (mimic_contract) — do not edit outside the reference module
 
+W = 14
+DELTA_CAP = 24.0
+LORENZ_SIGMA, LORENZ_RHO, LORENZ_BETA = 10.0, 28.0, 8.0 / 3.0
+LORENZ_DT = 0.02
+LORENZ_STEPS = 2000
+
+K = 39
+FEATURE_NAMES = [
+    "HR", "O2Sat", "Temp", "SBP", "MAP", "DBP", "Resp", "EtCO2",
+    "BaseExcess", "HCO3", "FiO2", "pH", "PaCO2", "SaO2", "AST", "BUN",
+    "Alkalinephos", "Calcium", "Chloride", "Creatinine", "Bilirubin_direct",
+    "Glucose", "Lactate", "Magnesium", "Phosphate", "Potassium",
+    "Bilirubin_total", "TroponinI", "Hct", "Hgb", "PTT", "WBC",
+    "Fibrinogen", "Platelets", "Age", "Gender", "Unit1", "Unit2",
+    "HospAdmTime",
+]
+VITALS = {"HR", "O2Sat", "Temp", "SBP", "MAP", "DBP", "Resp", "EtCO2",
+          "FiO2", "pH", "SaO2", "Age", "Gender", "Unit1", "Unit2"}
+DEMOGRAPHICS_FROM = 34  # Age .. HospAdmTime are static, always observed
+
 
 def _rng(seed: int) -> np.random.Generator:
     return np.random.default_rng(seed)

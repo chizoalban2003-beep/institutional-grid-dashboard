@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import numpy as np
 
+# >>> VENDOR (mimic_contract) — do not edit outside the reference module
+
 W = 14
 DELTA_CAP = 24.0
 LORENZ_SIGMA, LORENZ_RHO, LORENZ_BETA = 10.0, 28.0, 8.0 / 3.0
@@ -46,8 +48,6 @@ FEATURE_NAMES = [
 VITALS = {"HR", "O2Sat", "Temp", "SBP", "MAP", "DBP", "Resp", "EtCO2",
           "FiO2", "pH", "SaO2", "Age", "Gender", "Unit1", "Unit2"}
 DEMOGRAPHICS_FROM = 34  # Age .. HospAdmTime are static, always observed
-
-# >>> VENDOR (mimic_contract) — do not edit outside the reference module
 
 
 def _rng(seed: int) -> np.random.Generator:
