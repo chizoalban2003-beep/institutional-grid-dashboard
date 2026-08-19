@@ -179,6 +179,24 @@ def map_fisher_to_phase2(f_p1: dict, k_subjects: int = K_MATH + K_CLINICAL,
     return out
 
 
+def normalize_fisher_global(f2: dict) -> dict:
+    """Mean-1 normalization GLOBALLY across all math parameters.
+
+    Splits the absolute loss-scale out of F (which is ~1e-8..1e-5 at the
+    Phase-1 optimum) so the lambda exchange rate is scale-free and the
+    lab sweep (lambda in {1, 10, 100}) transfers directly. The mean is
+    computed over ALL math tensors together (not per-tensor) so the
+    relative structural importance between gru.weight_ih, the decode
+    blocks and the math heads is preserved.
+    """
+    total = float(sum(np.asarray(v).sum() for v in f2.values()))
+    n = float(sum(np.asarray(v).size for v in f2.values()))
+    mean = total / max(n, 1.0)
+    if not np.isfinite(mean) or mean <= 0.0:
+        raise ValueError(f"bad global Fisher mean: {mean}")
+    return {k: np.asarray(v, dtype=np.float64) / mean for k, v in f2.items()}
+
+
 def risk_weights(values, mask, drop_weight: float = 3.0):
     """Per-feature risk from observed-slot volatility (pie-chart Risk slice).
 

@@ -5,8 +5,8 @@ import pytest
 
 from curriculum.phase2_transfer import (
     COLUMN_COPY_SPEC, TRANSFER_KEYS, dims_for_phase2, map_fisher_to_phase2,
-    partial_key, plan_transfer, risk_weights, risk_weighted_fidelity,
-    split_transfer_keys, transferable,
+    normalize_fisher_global, partial_key, plan_transfer, risk_weights,
+    risk_weighted_fidelity, split_transfer_keys, transferable,
 )
 
 
@@ -96,6 +96,26 @@ def test_fisher_map_places_math_columns_only():
     for i in range(6):
         assert f2[f"heads.{i}.weight"].shape == (1, 192)
         assert f2[f"heads.{i}.bias"].shape == (1,)
+
+
+def test_fisher_normalize_global_mean_one():
+    f2 = map_fisher_to_phase2(_fake_fisher_p1())
+    f2["heads.0.weight"] = f2["heads.0.weight"] * 100.0  # structural contrast
+    fn = normalize_fisher_global(f2)
+    vals = np.concatenate([np.asarray(v).ravel() for v in fn.values()])
+    assert np.isclose(vals.mean(), 1.0)
+    # relative importance survives: heads.0 (amplified 100x) still dominates
+    h = fn["heads.0.weight"]
+    g = fn["gru.weight_ih_l0"]
+    assert h.mean() > 10.0 * g.mean()
+    # clinical columns stay exactly zero (free to learn)
+    assert np.all(fn["gru.weight_ih_l0"][:, 18:] == 0.0)
+
+
+def test_fisher_normalize_rejects_degenerate():
+    import pytest
+    with pytest.raises(ValueError):
+        normalize_fisher_global({"a": np.zeros((2, 2))})
 
 
 def test_fisher_map_blocks_match_column_spec():
