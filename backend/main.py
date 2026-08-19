@@ -16,10 +16,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import sys, os
+import sys, os, json, glob
+from typing import Optional
+
 # Add bridge to path so it can be imported
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from bridge.fhir_bridge import PatientState, ingest_fhir_bundle, build_diagnostic_report
+from backend.mimic.loader import get_mimic_loader, load_mimic_into_backend
 
 # ─── FHIR Patient State Store ────────────────────────────────────────────────
 
@@ -329,6 +332,36 @@ def zscore_window(window_raw, window_mask, window_delta):
 @app.on_event("startup")
 def startup():
     load_model()
+
+
+class MIMCLoadRequest(BaseModel):
+    n_stays: int = 50
+    seed: int = 42
+
+
+@app.post("/mimic/load")
+def load_mimic(req: MIMCLoadRequest):
+    """Load synthetic MIMIC-IV data into the backend.
+
+    Merges MIMIC ICU stays with existing PhysioNet patients,
+    making them available through /predict and /stream endpoints.
+    """
+    global patient_data, z_mu, z_sd
+
+    summary = load_mimic_into_backend(globals(), n_stays=req.n_stays)
+
+    return {
+        "status": "loaded",
+        "summary": summary,
+        "total_patients": len(patient_data),
+    }
+
+
+@app.get("/mimic/summary")
+def mimic_summary():
+    """Get summary of loaded MIMIC data."""
+    loader = get_mimic_loader()
+    return loader.summary()
 
 
 @app.get("/health")

@@ -311,9 +311,6 @@ class MIMICStayAssembler:
         mask = np.zeros((T, K), dtype=np.float32)
         delta = np.full((T, K), 48.0, dtype=np.float32)  # Max cap
 
-        # Track last observation time per feature
-        last_obs = [None] * K
-
         for charttime, feat_idx, value in self.events:
             hour = int((charttime - self.start_time).total_seconds() / 3600)
             hour = min(hour, T - 1)
@@ -321,20 +318,20 @@ class MIMICStayAssembler:
             # Multiple observations in same hour — take the last one
             values[hour, feat_idx] = value
             mask[hour, feat_idx] = 1.0
-            last_obs[feat_idx] = hour
 
         # Forward fill + compute delta
         for c in range(K):
             last_val = 0.0
+            last_seen = None  # Track last observed hour in this forward pass
             for t in range(T):
                 if mask[t, c]:
                     last_val = values[t, c]
-                    last_obs[c] = t
+                    last_seen = t
                 else:
                     # Forward fill
                     values[t, c] = last_val
-                    if last_obs[c] is not None:
-                        delta[t, c] = min(t - last_obs[c], 48.0)
+                    if last_seen is not None:
+                        delta[t, c] = min(t - last_seen, 48.0)
 
         return values, mask, delta
 
