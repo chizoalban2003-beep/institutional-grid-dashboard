@@ -417,6 +417,9 @@ def main():
         "params": params,
         "train_seconds": round(time.time() - t0, 1),
     }
+    # certified checkpoint: the Phase-2 transfer init source (v10+)
+    torch.save(model.state_dict(), "/kaggle/working/math_school_s42.pt")
+    report["checkpoint"] = "math_school_s42.pt"
     with open("/kaggle/working/phase1_report.json", "w") as f:
         json.dump(report, f, indent=2)
     with open("/kaggle/working/phase1_summary.txt", "w") as f:
