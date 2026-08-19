@@ -41,17 +41,28 @@ def generate_stay(
     n_hours: int,
     scenario: str = "stable",
     seed: int = None,
+    onset_hour: int = None,
 ) -> list[dict]:
     """Generate charted events for one ICU stay.
 
     Scenarios:
     - stable: Normal vitals, mild fluctuations
-    - deteriorating: Progressive sepsis trajectory
+    - deteriorating: Progressive sepsis trajectory (subtle, patient-varying)
     - recovering: Post-intervention recovery
+
+    onset_hour: hour at which deterioration begins (deteriorating stays).
+    When None it is sampled per patient from U{4..20} — onset varies
+    between patients, so detection requires trend learning, not a
+    threshold against a universal baseline.
     """
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
+
+    if onset_hour is None and scenario == "deteriorating":
+        onset_hour = random.randint(4, 20)
+    elif onset_hour is None:
+        onset_hour = 0
 
     events = []
     base_time = datetime(2020, 1, 1, 0, 0, 0)
@@ -76,6 +87,16 @@ def generate_stay(
         "Hct": (39.0, 4.0),
     }
 
+    # Per-patient baseline jitter: real patients have different resting
+    # baselines (resting HR 55-90, SBP 100-150, etc.). Without this,
+    # deterioration is trivially separable by thresholding. Jitter is
+    # scaled to each feature's natural variability (1.5x its std), so
+    # cross-patient spread ~ drift magnitude (the hard case).
+    baselines = {
+        feat: (mean + np.random.normal(0, std * 1.5), std)
+        for feat, (mean, std) in baselines.items()
+    }
+
     # Missingness rates (fraction of hours missing)
     miss_rates = {
         "HR": 0.05,
@@ -96,52 +117,62 @@ def generate_stay(
         "Hct": 0.55,
     }
 
+    # Per-patient response jitter: sepsis progresses at different rates and
+    # intensities per patient (amplitude ~U[0.7, 1.3]x, rate multiplier on
+    # the 12h ramp). Keeps the drift patient-specific, anchored to the
+    # patient's OWN jittered baseline (never the population mean — that
+    # would create a point-mass ribbon any model can threshold).
+    amp = random.uniform(0.7, 1.3) if scenario == "deteriorating" else 1.0
+    rate = 12.0 / random.uniform(8.0, 18.0) if scenario == "deteriorating" else 1.0
+
     for hour in range(n_hours):
         charttime = base_time + timedelta(hours=hour)
 
         for feat, (mean, std) in baselines.items():
-            # Scenario-driven drift
+            # Scenario-driven drift (subtle: comparable to patient variance)
             if scenario == "deteriorating":
-                progression = min(hour / 12.0, 1.0)
+                progression = min(max((hour - onset_hour) * rate, 0.0), 1.0)
                 if feat == "HR":
-                    mean = 72 + progression * 45
-                    std = 8
+                    mean += progression * 8 * amp
+                    std = 6
                 elif feat == "O2Sat":
-                    mean = 97 - progression * 10
-                    std = 1.5
+                    mean -= progression * 2 * amp
+                    std = 1.2
                 elif feat == "Temp":
-                    mean = 36.8 + progression * 2.2
-                    std = 0.4
-                elif feat == "SBP":
-                    mean = 120 - progression * 30
-                    std = 12
-                elif feat == "Lactate":
-                    mean = 1.2 + progression * 5.0
-                    std = 0.8
-                elif feat == "WBC":
-                    mean = 7.0 + progression * 12
-                    std = 3.0
-                elif feat == "Glucose":
-                    mean = 90 + progression * 50
-                    std = 25
-                elif feat == "Creatinine":
-                    mean = 0.9 + progression * 1.5
+                    mean += progression * 0.4 * amp
                     std = 0.3
+                elif feat == "SBP":
+                    mean -= progression * 12 * amp
+                    std = 10
+                elif feat == "Lactate":
+                    mean += progression * 0.5 * amp
+                    std = 0.5
+                elif feat == "WBC":
+                    mean += progression * 2.5 * amp
+                    std = 2.0
+                elif feat == "Glucose":
+                    mean += progression * 15 * amp
+                    std = 15
+                elif feat == "Creatinine":
+                    mean += progression * 0.3 * amp
+                    std = 0.2
                 elif feat == "FiO2":
-                    mean = 0.21 + progression * 0.6
-                    std = 0.1
+                    mean += progression * 0.12 * amp
+                    std = 0.05
 
             elif scenario == "recovering":
-                # Started bad, getting better
-                progression = max(0, 1.0 - hour / 24.0)
+                # Started bad (relative to own baseline), getting better.
+                # Decays back to the patient's OWN jittered baseline, never
+                # to the population mean.
+                offset = max(0.0, 1.0 - hour / 24.0)
                 if feat == "HR":
-                    mean = 110 - progression * 40
+                    mean += 30 * offset
                 elif feat == "O2Sat":
-                    mean = 88 + progression * 9
+                    mean -= max(0.0, mean - 90) * offset
                 elif feat == "Lactate":
-                    mean = 5.0 - progression * 4.0
+                    mean += 3.0 * offset
                 elif feat == "WBC":
-                    mean = 15 - progression * 8
+                    mean += 6.0 * offset
 
             # Random missingness
             if random.random() < miss_rates[feat]:
@@ -217,7 +248,11 @@ def generate_cohort(
         n_hours = random.randint(*n_hours_range)
         scenario = random.choice(scenarios)
 
-        events = generate_stay(stay_id, subject_id, n_hours, scenario, seed=seed+i)
+        # Sample the deterioration onset for label alignment
+        onset_hour = random.randint(4, 20) if scenario == "deteriorating" else 0
+
+        events = generate_stay(stay_id, subject_id, n_hours, scenario, seed=seed+i,
+                               onset_hour=onset_hour)
         all_events.extend(events)
 
         stays.append({
@@ -229,6 +264,8 @@ def generate_cohort(
             'intime': events[0]['charttime'] if events else '',
             'outtime': events[-1]['charttime'] if events else '',
             'los': n_hours,
+            'scenario': scenario,
+            'onset_hour': onset_hour,
         })
 
     # Sort events by time
@@ -245,7 +282,7 @@ def generate_cohort(
     # Write icustays
     icustays_path = os.path.join(output_dir, 'icustays.csv')
     with open(icustays_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['stay_id', 'subject_id', 'hadm_id', 'first_careunit', 'last_careunit', 'intime', 'outtime', 'los'])
+        writer = csv.DictWriter(f, fieldnames=['stay_id', 'subject_id', 'hadm_id', 'first_careunit', 'last_careunit', 'intime', 'outtime', 'los', 'scenario', 'onset_hour'])
         writer.writeheader()
         for stay in stays:
             writer.writerow(stay)
