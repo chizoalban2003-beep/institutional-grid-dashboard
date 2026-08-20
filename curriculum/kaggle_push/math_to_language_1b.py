@@ -730,6 +730,16 @@ def main():
     # decode_cell.weight_ih (576, 220+3?) — the LanguageGrid decode ctx
     # is d_in + 64 + k_subjects + vocab = 120+64+39+4 = 227 vs crowned
     # 117+64+39 = 220. New language cols + vocab-ctx cols zero-init.
+    # DECODE_CTX BLOCK SHIFT (Gate-1b bug, 2026-08-20): the crowned
+    # decode ctx is [x(117), pooled(64), prev(39)] = 220; the LanguageGrid
+    # ctx is [x(120), pooled(64), prev(39), prev_tok(4)] = 227. The 3 new
+    # language input cols shift pooled -> [120:184] and prev -> [184:223].
+    # A naive p[:, :220] = v lands pooled/prev 3 cols off and corrupts the
+    # whole decode path (math base collapsed to ~0 at init while crowned
+    # scored 0.857 worst on the same windows). Block-spec copy:
+    DECODE_BLOCKS = [(0, 117, 0, 117),        # x: shared cols
+                     (120, 184, 117, 181),    # pooled: shifted +3
+                     (184, 223, 181, 220)]    # prev: shifted +3
     with torch.no_grad():
         for k, v in crowned.items():
             if k in ("vocab_head.weight", "vocab_head.bias"):
@@ -737,10 +747,15 @@ def main():
             p = dict(model.named_parameters())[k]
             if tuple(p.shape) == tuple(v.shape):
                 p.copy_(v)
+            elif k == "decode_cell.weight_ih":
+                # shifted block copy; language x cols + prev_tok stay 0
+                for tlo, thi, slo, shi in DECODE_BLOCKS:
+                    p[:, tlo:thi].copy_(v[:, slo:shi])
             elif p.ndim == 2 and v.ndim == 2 and p.shape[0] == v.shape[0] \
                     and p.shape[1] > v.shape[1]:
-                # input-projection growth: copy the shared columns, zero
-                # the new language columns (dormant-protocol parity)
+                # input-projection growth (gru.weight_ih: append-only, no
+                # internal shift) — copy the shared columns, zero the new
+                # language columns (dormant-protocol parity)
                 p[:, :v.shape[1]].copy_(v)
                 p[:, v.shape[1]:].zero_()
             elif p.ndim == 1 and v.ndim == 1 and p.shape[0] == v.shape[0]:
