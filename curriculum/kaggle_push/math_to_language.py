@@ -31,9 +31,9 @@ import torch.nn as nn
 torch.set_num_threads(4)
 
 SEED = 42
-N_WORDS = 2048
+N_WORDS = 4096
 N_TEST_WORDS = 256
-N_EPOCHS = 40
+N_EPOCHS = 100
 BATCH = 512
 LR = 1e-4
 ACC_FLOOR = 0.90
@@ -299,11 +299,11 @@ def main():
             xb, yb, mb = Xtr[idx], Ytr[idx], Mtr[idx]
             opt.zero_grad(set_to_none=True)
             _, vlog = model(xb)
-            dm = (1.0 - mb).bool()
-            lg = vlog[dm]
-            tg = yb[dm]
-            if lg.numel() == 0:
-                continue
+            # v2: CE on ALL positions (Phase-1 parity — train on observed +
+            # dropped, grade dropped-only). Masked-only CE starved the
+            # vocab head: ~50% of tokens contributed zero gradient.
+            lg = vlog.reshape(-1, V)
+            tg = yb.reshape(-1)
             loss = nn.functional.cross_entropy(lg, tg)
             loss.backward()
             opt.step()
