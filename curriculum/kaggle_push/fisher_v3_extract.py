@@ -449,8 +449,8 @@ def embed_math_block(X18: np.ndarray,
 
 
 # <<< VENDOR (mimic_contract) — do not edit outside the reference module
-# (clinical_windows + contract constants are synced by
-# curriculum/sync_vendored.py; N_STAYS is kernel-side.)
+
+N_STAYS = 2048      # kernel-side (not part of the vendored contract)
 
 
 def main():
