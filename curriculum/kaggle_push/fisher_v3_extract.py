@@ -516,11 +516,14 @@ def main():
         assert torch.isfinite(v).all(), f"non-finite F on {k}"
     # Structural zeros are HONEST (scorer hard-topk, clinical heads via
     # hard-copy m=1); keys that MUST carry loading:
+    # heads 6-33 = vitals+labs (drop-pattern-dependent, MUST carry loading);
+    # heads 34-38 = DEMOGRAPHICS (always observed by contract -> hard copy
+    # pins them -> F=0 is HONEST, like scorer). heads.38 is demographics.
     must_carry = ["gru.weight_ih_l0", "gru.weight_hh_l0",
                   "decode_cell.weight_ih", "decode_cell.weight_hh",
                   "cell_block.weight", "cell_block.bias",
                   "heads.0.weight", "heads.5.weight",
-                  "heads.6.weight", "heads.38.weight"]
+                  "heads.6.weight", "heads.33.weight"]
     for k in must_carry:
         assert F[k].sum() > 0.0, f"zero F on {k} (expected gradient path)"
     zero_keys = [k for k, v in F.items() if v.sum() == 0.0]
