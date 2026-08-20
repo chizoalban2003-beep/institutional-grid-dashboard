@@ -37,7 +37,7 @@ N_BATCHES = 16          # 2048 exam windows — stable full-surface F
 
 # ---------------------------- constants (certified Phase-1 recipe)
 
-K_SUBJECTS = 6
+K_MATH_SUBJECTS = 6       # math-generator subjects (NOT the vendored K_SUBJECTS=39)
 EXAM_KINDS = ["sine", "cosine", "decay", "step", "sigmoid", "lorenz"]
 W = 14
 T_STAY = 256
@@ -125,7 +125,7 @@ def lorenz_x(stay_rng, n=LORENZ_STEPS, dt=LORENZ_DT):
 def continuum(stay_rng):
     T = T_STAY
     t = np.arange(T, dtype=float)
-    V = np.empty((T, K_SUBJECTS))
+    V = np.empty((T, K_MATH_SUBJECTS))
     A = stay_rng.uniform(0.5, 1.5)
     f1 = stay_rng.uniform(0.02, 0.12)
     phi = stay_rng.uniform(0, 2 * np.pi)
