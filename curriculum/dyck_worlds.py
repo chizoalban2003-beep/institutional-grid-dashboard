@@ -1,0 +1,153 @@
+"""Dyck-n language stem — Phase 3 "syntax primary school" (numpy lab).
+
+Mirrors math_worlds.py / mimic_contract.py exactly: controlled archetype
+first, real data later. Dyck-2 (two bracket types) with BOUNDED depth,
+words corrupted by EHR-style masking, encoded as [value, mask, delta]
+triplets — masked-language-modeling in the shared triple-channel
+protocol. True-Y masked grading (token accuracy on dropped slots) is the
+exam, identical in shape to the math/clinical exam machinery.
+
+Literature anchors (Gate-2 scan, 2026-08-20):
+  - Bhattamishra et al. COLING 2020: RNNs generalize near-perfectly on
+    Dyck when train/test lengths are in the same range; bounded depth is
+    the tractable regime. Our W=14 windows are same-range by construction.
+  - Dave/Kifer/Giles/Mali PMLR 2025: Dyck-2 > Dyck-1 for recurrent
+    stability; single neurons fail Dyck-2 — a meaningful, non-trivial bar.
+  - Yu et al. BlackboxNLP 2019: bracket-tagging is an insufficient probe;
+    masked imputation with true-Y grading is the honest metric.
+
+Encoding: value = token id (ffill'd at dropped slots), mask = observed
+flag (1 = observed), delta = positions since last observation (capped,
+0 on observed). Tokens: V=4 ids for '(', ')', '[', ']'.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+# >>> VENDOR (dyck_worlds) — do not edit outside the reference module
+
+V = 4                                  # vocabulary: (, ), [, ]
+TOKENS = ["(", ")", "[", "]"]
+DEPTH_MAX = 4                          # bounded nesting depth (Dyck-2, depth<=4)
+W = 14                                 # window length (shared core unroll)
+T_MIN, T_MAX = 32, 64                  # word length range (same-range split)
+SLIDE = 2
+CAP_WINDOWS = 24
+DROP_LO, DROP_HI = 0.30, 0.70          # EHR-style per-position masking
+DELTA_CAP = 24.0
+
+
+def _rng(seed: int) -> np.random.Generator:
+    return np.random.default_rng(seed)
+
+
+def generate_word(rng: np.random.Generator,
+                  t_min: int = T_MIN, t_max: int = T_MAX,
+                  depth_max: int = DEPTH_MAX) -> np.ndarray:
+    """One balanced Dyck-2 word (array of token ids), bounded depth.
+
+    Constrained random walk over depth with '('/'[' (+1) and ')'/']'
+    (-1), keeping depth in [0, depth_max]: a step that would violate the
+    bounds is forced to the other action; otherwise random (~45% close).
+    The residual unmatched openers are then APPENDED with their matching
+    closers (never overwriting emitted tokens), so the word is balanced
+    by construction with length in [n, n + depth_max]. Closing bracket
+    type MUST match the most recent unmatched opener (stack discipline)
+    — this is the hierarchical dependency the GRU must learn.
+    """
+    n = int(rng.integers(t_min, t_max + 1))
+    ids = np.zeros(n, dtype=np.int64)
+    stack = []                          # 0 = '(', 1 = '['
+    depth = 0
+    for i in range(n):
+        can_close = depth > 0
+        can_open = depth < depth_max
+        if can_close and (not can_open or rng.random() < 0.45):
+            open_type = stack.pop()
+            ids[i] = 2 + open_type      # ')'=2 for '(', ']'=3 for '['
+            depth -= 1
+        else:
+            open_type = int(rng.integers(0, 2))
+            stack.append(open_type)
+            ids[i] = open_type
+            depth += 1
+    # append matching closers for any residual openers (safe: append only)
+    while stack:
+        open_type = stack.pop()
+        ids = np.concatenate([ids, np.array([2 + open_type])])
+    return ids
+
+
+def build_dyck_dataset(n_words: int, seed: int,
+                       aligned: bool = True) -> tuple[np.ndarray, np.ndarray,
+                                                      np.ndarray]:
+    """(X, Y, M): X (B, W, 3) [value_ffill, mask, delta], Y (B, W) true
+    token ids, M (B, W) observation flags (1 = observed).
+
+    aligned=True: windows START at word positions 0, W, 2W, ... (chunk
+    alignment) so every closing bracket's opener is inside the window
+    whenever possible — preserves the stack-tracking signal per window.
+    aligned=False: sliding windows (SLIDE), closers whose opener fell
+    before the window start are legitimately under-determined (the model
+    learns the conditional marginal) — the rand floor (Gate 1a) measures
+    the achievable bar either way.
+    """
+    rng = _rng(seed)
+    X, Y, M = [], [], []
+    for i in range(n_words):
+        ids = generate_word(_rng(int(rng.integers(0, 2 ** 31))))
+        T = len(ids)
+        mask = (rng.random(T) >= rng.uniform(DROP_LO, DROP_HI)).astype(
+            np.float32)
+        value = ids.astype(np.float32).copy()
+        last = -1
+        for t in range(T):
+            if mask[t] > 0.5:
+                last = t
+            elif last >= 0:
+                value[t] = value[last]
+            else:
+                value[t] = 0.0          # cold start: nothing observed yet
+        delta = np.zeros(T, dtype=np.float32)
+        last_obs = -1
+        for t in range(T):
+            if mask[t] > 0.5:
+                last_obs = t
+                delta[t] = 0.0
+            elif last_obs >= 0:
+                delta[t] = min(t - last_obs, DELTA_CAP)
+            else:
+                delta[t] = DELTA_CAP
+        if aligned:
+            starts = range(0, T - W + 1, W)
+        else:
+            n_win = (T - W) // SLIDE + 1
+            starts = range(0, n_win * SLIDE, SLIDE)
+            if n_win > CAP_WINDOWS:
+                g2 = np.random.default_rng(1000 + i)
+                starts = sorted(np.random.default_rng(1000 + i).choice(
+                    list(starts), size=CAP_WINDOWS, replace=False))
+        for s in starts:
+            a, b = int(s), int(s) + W
+            x = np.stack([value[a:b], mask[a:b], delta[a:b]], axis=-1)
+            X.append(x.astype(np.float32))
+            Y.append(ids[a:b])
+            M.append(mask[a:b])
+    return (np.stack(X), np.stack(Y), np.stack(M))
+
+
+def token_accuracy(pred_logits: np.ndarray, y: np.ndarray,
+                   mask: np.ndarray) -> float:
+    """Masked token accuracy on DROPPED positions (the Phase-3 exam).
+
+    pred_logits: (B, W, V) model output; argmax per position vs true id.
+    """
+    pred = np.argmax(pred_logits, axis=-1)
+    dropped = ~(mask > 0.5)
+    if not dropped.any():
+        return 0.0
+    return float((pred[dropped] == y[dropped]).mean())
+
+
+# <<< VENDOR (dyck_worlds) — do not edit outside the reference module
