@@ -47,8 +47,10 @@ K_ACTIVE = 3
 K_MATH = 6
 K_CLINICAL = 33
 K_SUBJECTS = K_MATH + K_CLINICAL          # 39 regression heads
-D_IN = 120                                # 117 + language triplet
-V = 4
+D_IN_LANG = 120                           # 117 + language triplet (kernel-side;
+                                          # D_IN is redefined to 117 by the
+                                          # vendored mimic_contract!)
+V_LANG = 4                                # vocab (V also vendored)
 
 # ---------------------------- vendored data contracts (see sync_vendored)
 
@@ -241,7 +243,7 @@ def stack_consistency(pred_logits: np.ndarray, y: np.ndarray,
     return float(hits / tot)
 
 
-def embed_language_block(X3: np.ndarray, total_dim: int = 120) -> np.ndarray:
+def embed_language_block(X3: np.ndarray, total_dim: int = D_IN_LANG) -> np.ndarray:
     """(B, W, 3) [value, mask, delta] language windows -> (B, W, 120) grid.
 
     The Phase-2 grid has 117 input columns (39 triplets: 6 math + 33
@@ -700,7 +702,7 @@ def main():
           flush=True)
 
     print("[2/6] CROWNED init (v2 lam10 fast, 117 -> 120)...", flush=True)
-    model = LanguageGrid(D_IN, HIDDEN, N_CELLS, K_ACTIVE, K_SUBJECTS, V)
+    model = LanguageGrid(D_IN_LANG, HIDDEN, N_CELLS, K_ACTIVE, K_SUBJECTS, V_LANG)
     ckpt_dir = discover_input("crowned-ckpt-fast")
     crowned = torch.load(os.path.join(ckpt_dir, "math2clinic_fast.pt"),
                          map_location="cpu", weights_only=True)
@@ -738,7 +740,7 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"  {n_par:,} params | uniform lr {LR} | lam {LAM_EWC:g} | "
-          f"vocab {V}", flush=True)
+          f"vocab {V_LANG}", flush=True)
 
     print("[4/6] legacy exams (math + clinical at crowned init)...",
           flush=True)
@@ -748,7 +750,7 @@ def main():
         """117-dim grid -> 120-dim with the language triplet DORMANT
         (value=0, mask=1, delta=0) — the reverse of embed_language_block."""
         B, Wn, _ = x117.shape
-        x = np.zeros((B, Wn, D_IN), dtype=np.float32)
+        x = np.zeros((B, Wn, D_IN_LANG), dtype=np.float32)
         x[:, :, :117] = x117
         x[:, :, 118] = 1.0              # language mask channel = observed
         return x
@@ -792,7 +794,7 @@ def main():
             xb, yb, mb = Xtr[idx], Ytr[idx], Mtr[idx]
             opt.zero_grad(set_to_none=True)
             _, vlog = model(xb)
-            lg = vlog.reshape(-1, V)
+            lg = vlog.reshape(-1, V_LANG)
             tg = yb.reshape(-1)
             loss = nn.functional.cross_entropy(lg, tg)
             ewc = ewc_penalty(model, f2, LAM_EWC)
