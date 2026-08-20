@@ -35,6 +35,12 @@ BLOCKS = [
         "start": "# >>> VENDOR (mimic_contract) — do not edit outside the reference module",
         "end": "# <<< VENDOR (mimic_contract) — do not edit outside the reference module",
     },
+    {
+        "ref": ROOT / "curriculum" / "mimic_contract.py",
+        "kernel": ROOT / "curriculum" / "kaggle_push" / "math_to_language_1b.py",
+        "start": "# >>> VENDOR (mimic_contract) — do not edit outside the reference module",
+        "end": "# <<< VENDOR (mimic_contract) — do not edit outside the reference module",
+    },
 ]
 
 
