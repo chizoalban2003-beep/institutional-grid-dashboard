@@ -29,6 +29,12 @@ BLOCKS = [
         "start": "# >>> VENDOR (dyck_worlds) — do not edit outside the reference module",
         "end": "# <<< VENDOR (dyck_worlds) — do not edit outside the reference module",
     },
+    {
+        "ref": ROOT / "curriculum" / "mimic_contract.py",
+        "kernel": ROOT / "curriculum" / "kaggle_push" / "fisher_v3_extract.py",
+        "start": "# >>> VENDOR (mimic_contract) — do not edit outside the reference module",
+        "end": "# <<< VENDOR (mimic_contract) — do not edit outside the reference module",
+    },
 ]
 
 
