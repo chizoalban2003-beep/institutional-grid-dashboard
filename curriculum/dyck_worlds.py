@@ -162,6 +162,58 @@ def token_accuracy(pred_logits: np.ndarray, y: np.ndarray,
     return float((pred[dropped] == y[dropped]).mean())
 
 
+def stack_consistency(pred_logits: np.ndarray, y: np.ndarray,
+                      mask: np.ndarray, depth_max: int = DEPTH_MAX) -> float:
+    """GRAMMAR-CONSISTENCY grader (Phase-3 acceptance gate, approved
+    2026-08-20): a prediction on a DROPPED position is CORRECT iff it is
+    a legal continuation of the stack built from the window's TRUE
+    tokens — a closer matching the stack top, or any opener within the
+    depth bound. This decouples the structural logic from the generator's
+    opener-type coin flip (exact-token accuracy caps ~0.74-0.78 even for
+    a perfect stack tracker; the 0.90 bar was unreachable by design).
+    The training loss is UNCHANGED (CE on exact tokens); only the
+    acceptance gate moves to grammar-consistency (the blueprint's
+    "Neutrality" slice: any token inside the legal manifold is neutral).
+
+    NOTE: stack state at window start is unknown (windows slice words,
+    h0=0) — the stack is built from observed TRUE tokens within the
+    window only, so a closer whose opener fell before the window start
+    is scored against the partial stack (a conservative underestimate).
+    """
+    pred = np.argmax(pred_logits, axis=-1)
+    B, Wn = y.shape
+    hits, tot = 0, 0
+    for b in range(B):
+        stack = []                      # 0='(', 1='[' (from true tokens)
+        for t in range(Wn):
+            if mask[b, t] > 0.5:
+                tok = int(y[b, t])
+                if tok < 2:
+                    stack.append(tok)
+                elif stack and tok == 2 + stack[-1]:
+                    stack.pop()
+                # mismatched closer in true data cannot happen (balanced)
+                continue
+            # dropped position: grade legality of the model's argmax
+            p = int(pred[b, t])
+            tot += 1
+            if p < 2:                   # opener: legal iff depth < max
+                if len(stack) < depth_max:
+                    hits += 1
+            else:                       # closer: legal iff matches top
+                if stack and p == 2 + stack[-1]:
+                    hits += 1
+            # advance the true stack past this position regardless
+            tok = int(y[b, t])
+            if tok < 2:
+                stack.append(tok)
+            elif stack and tok == 2 + stack[-1]:
+                stack.pop()
+    if tot == 0:
+        return 0.0
+    return float(hits / tot)
+
+
 def embed_language_block(X3: np.ndarray, total_dim: int = 120) -> np.ndarray:
     """(B, W, 3) [value, mask, delta] language windows -> (B, W, 120) grid.
 

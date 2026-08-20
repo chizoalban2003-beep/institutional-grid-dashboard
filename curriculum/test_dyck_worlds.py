@@ -5,7 +5,7 @@ import pytest
 
 from curriculum.dyck_worlds import (
     DEPTH_MAX, DROP_HI, DROP_LO, T_MAX, T_MIN, V, W, build_dyck_dataset,
-    generate_word, token_accuracy,
+    generate_word, stack_consistency, token_accuracy,
 )
 
 
@@ -109,6 +109,64 @@ def test_token_accuracy_grader():
     # perfect logits but only observed slots -> 0.0 (exam is dropped-only)
     m2 = np.ones_like(m)
     assert token_accuracy(logits, y, m2) == 0.0
+
+
+def test_stack_consistency_perfect_model():
+    # A perfect model is ALWAYS grammar-consistent EXCEPT at closers whose
+    # opener fell before the window start (stack built from in-window TRUE
+    # tokens only — the documented conservative underestimate). Score must
+    # be >= 0.85 (the aligned-window boundary loss is ~10-15%).
+    X, Y, M = build_dyck_dataset(64, 9, aligned=True)
+    logits = np.zeros((len(X), W, V))
+    logits[np.arange(len(X))[:, None], np.arange(W)[None, :], Y] = 1.0
+    assert stack_consistency(logits, Y, M) >= 0.85
+
+
+def test_stack_consistency_grades_legal_coin_flip():
+    # y = '[' ']' '(' ')'; drop the FIRST token. Truth is '[' (1); model
+    # predicts '(' (0) — wrong exact token but a legal opener: exact = 0,
+    # consistency = 1.
+    y = np.array([[1, 3, 0, 2]], dtype=np.int64)      # [ ] ( )
+    m = np.array([[0.0, 1.0, 1.0, 1.0]])              # drop position 0
+    lg = np.zeros((1, 4, V))
+    lg[0, 0, 0] = 1.0                                 # predicts '('
+    assert token_accuracy(lg, y, m) == 0.0
+    assert stack_consistency(lg, y, m) == 1.0
+
+
+def test_stack_consistency_punishes_illegal_closer():
+    # stack top is '(' (true token 0 observed); model predicts ']' (3):
+    # not a legal closer (only ')'=2 matches) -> 0 consistent.
+    y = np.array([[0, 2]], dtype=np.int64)            # ( )
+    m = np.array([[1.0, 0.0]])                        # drop position 1
+    lg = np.zeros((1, 2, V))
+    lg[0, 1, 3] = 1.0                                 # predicts ']'
+    assert stack_consistency(lg, y, m) == 0.0
+
+
+def test_stack_consistency_depth_bound():
+    # depth_max=1: after one observed opener, predicting another opener is
+    # ILLEGAL (depth would reach 2 > 1); predicting the matching closer ok.
+    y = np.array([[0, 0, 2]], dtype=np.int64)         # ( ( )
+    m = np.array([[1.0, 0.0, 1.0]])                   # drop position 1
+    lg = np.zeros((1, 3, V))
+    lg[0, 1, 0] = 1.0                                 # predicts '(' -> depth 2
+    assert stack_consistency(lg, y, m, depth_max=1) == 0.0
+    lg2 = np.zeros((1, 3, V))
+    lg2[0, 1, 2] = 1.0                                # predicts ')' -> matches top
+    assert stack_consistency(lg2, y, m, depth_max=1) == 1.0
+
+
+def test_stack_consistency_advances_stack_past_dropped():
+    # dropped opener still enters the true stack: y = ( ( ) ; drop 0 and 1.
+    # At position 2 (true ')'), consistency is graded on the stack from
+    # BOTH dropped true tokens (depth 2 -> ')' matches).
+    y = np.array([[0, 0, 2]], dtype=np.int64)
+    m = np.array([[0.0, 0.0, 1.0]])
+    lg = np.zeros((1, 3, V))
+    lg[0, 0, 0] = 1.0                                 # '(' at 0: legal
+    lg[0, 1, 1] = 1.0                                 # '[' at 1: legal
+    assert stack_consistency(lg, y, m) == 1.0
 
 
 def test_generator_deterministic():
