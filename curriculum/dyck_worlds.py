@@ -34,7 +34,19 @@ W = 14                                 # window length (shared core unroll)
 T_MIN, T_MAX = 32, 64                  # word length range (same-range split)
 SLIDE = 2
 CAP_WINDOWS = 24
-DROP_LO, DROP_HI = 0.30, 0.70          # EHR-style per-position masking
+DROP_LO, DROP_HI = 0.10, 0.30          # SPARSE masking (v3, Gate-1 revision
+                                       # 2026-08-20): Dyck-n has ZERO
+                                       # redundancy — a dropped '[' makes the
+                                       # matching ']' mathematically
+                                       # unpredictable. v1/v2 masked 50%
+                                       # (EHR-style, right for noisy ICU data,
+                                       # WRONG for formal grammar) -> dropped-
+                                       # token marginal went near-uniform and
+                                       # the floor capped at 0.381 (the
+                                       # ambiguity ceiling, not a learning
+                                       # failure). 10-30% = the BERT MLM
+                                       # standard regime, adapted for a
+                                       # zero-redundancy grammar.
 DELTA_CAP = 24.0
 
 
