@@ -475,11 +475,8 @@ def main():
           flush=True)
 
     print("[3/4] F_total = F_math + F_clinical accumulation...", flush=True)
-    F = {k: torch.zeros_like(p) for k, p in model.named_parameters()}
 
-    def accumulate(xb, yb, mb, loss_fn, tag):
-        for k in F:
-            pass
+    def accumulate(F_target, xb, yb, mb, loss_fn, tag):
         for bi in range(N_BATCHES):
             sl = slice(bi * BATCH, (bi + 1) * BATCH)
             x = xb[sl] if xb.shape[0] >= (bi + 1) * BATCH else xb[bi * BATCH:]
@@ -490,25 +487,30 @@ def main():
             loss.backward()
             for k, p in model.named_parameters():
                 if p.grad is not None:
-                    F[k] += p.grad.detach() ** 2
+                    F_target[k] += p.grad.detach() ** 2
             model.zero_grad(set_to_none=True)
-        for k in F:
-            F[k] /= N_BATCHES
-        print(f"  [{tag}] accumulated over {N_BATCHES} batches", flush=True)
+        for k in F_target:
+            F_target[k] /= N_BATCHES
+        # per-surface diagnostic: which heads carry gradient in THIS surface
+        diag = {k: float(F_target[k].sum()) for k in F_target
+                if k.startswith("heads.") and k.endswith(".weight")}
+        print(f"  [{tag}] head-F sums: "
+              + " ".join(f"{k}:{v:.2e}" for k, v in diag.items()),
+              flush=True)
 
     # surface 1: math (certified exam windows, clinical dormant)
+    F_math = {k: torch.zeros_like(p) for k, p in model.named_parameters()}
     G_m = torch.tensor(embed_math_block(X18), dtype=torch.float32)
-    accumulate(G_m, torch.tensor(YM), torch.tensor(MM),
+    accumulate(F_math, G_m, torch.tensor(YM), torch.tensor(MM),
                lambda p, y, m: ((p[:, :, :K_MATH] - y) ** 2
                                 * (1.0 - m)).sum() / max((1.0 - m).sum(), 1),
                "math")
 
     # surface 2: clinical (mimic_contract windows, math dormant)
-    F_math = {k: v.clone() for k, v in F.items()}
-    accumulate(torch.tensor(XC), torch.tensor(YC), torch.tensor(MC),
+    F_clin = {k: torch.zeros_like(p) for k, p in model.named_parameters()}
+    accumulate(F_clin, torch.tensor(XC), torch.tensor(YC), torch.tensor(MC),
                clinical_loss, "clinical")
-    F_clin = {k: v.clone() for k, v in F.items()}
-    F = {k: F_math[k] + F_clin[k] for k in F}
+    F = {k: F_math[k] + F_clin[k] for k in F_math}
 
     for k, v in F.items():
         assert torch.isfinite(v).all(), f"non-finite F on {k}"
