@@ -745,7 +745,11 @@ def main():
     XM, YM, MM = exam_windows(192, SEED + 2)     # math exam (certified)
     XC, YC, MC = clinical_windows(64, SEED + 3)  # clinical (mimic contract)
     XM = torch.tensor(embed_math_block(XM), dtype=torch.float32)
+    YM = torch.tensor(YM, dtype=torch.float32)
+    MM = torch.tensor(MM, dtype=torch.float32)
     XC = torch.tensor(XC, dtype=torch.float32)   # already 117-dim
+    YC = torch.tensor(YC, dtype=torch.float32)
+    MC = torch.tensor(MC, dtype=torch.float32)
     with torch.no_grad():
         p_m = model(XM)[0]
         p_c = model(XC)[0]
