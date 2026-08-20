@@ -620,15 +620,18 @@ def run_arm(arm, Xtr, Ytr, Mtr, Xte, Yte, Mte, t0):
                 f"{len(copied)} + {len(partial_copied)}")
         opt = torch.optim.Adam(param_groups(model))
     else:
-        print("  [rand] NO transfer, NO anchor — from-scratch clinical "
-              "learning", flush=True)
+        tag = "rand" if arm == "rand" else "ranka"
+        anchor_on = arm == "ranka"
+        print(f"  [{tag}] NO transfer" + (", anchor ON" if anchor_on
+                                          else ", NO anchor")
+              + " — from-scratch clinical learning", flush=True)
         opt = torch.optim.Adam(model.parameters(), lr=LR_NEW)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"  {n_par:,} params", flush=True)
 
     Xex, Yex, Mex = exam_inputs()
     r2_base = None
-    if arm == "trans":
+    if arm in ("trans", "ranka"):
         r2_base = exam_r2(model, Xex, Yex, Mex)
         print("  baseline " + " ".join(f"{k} {r2_base[k]:.3f}"
                                        for k in EXAM_KINDS), flush=True)
@@ -645,7 +648,7 @@ def run_arm(arm, Xtr, Ytr, Mtr, Xte, Yte, Mte, t0):
             opt.zero_grad(set_to_none=True)
             pred = model(xb)
             loss = fidelity_loss(pred, yb, 1.0 - mb, yb, mb)
-            if arm == "trans" and LAMBDA_MATH > 0:
+            if arm in ("trans", "ranka") and LAMBDA_MATH > 0:
                 loss = loss + LAMBDA_MATH * exam_loss(model, Xex, Yex, Mex)
             if not torch.isfinite(loss):
                 print(f"  WARN ep {ep} non-finite loss — skipping step")
@@ -658,8 +661,8 @@ def run_arm(arm, Xtr, Ytr, Mtr, Xte, Yte, Mte, t0):
             cr2 = clinical_r2_curve(model, Xte, Yte, Mte)
             curve.append({"epoch": ep + 1, "clinical_r2": cr2})
             note = f" CLIN-R2 {cr2:.4f}"
-            if arm == "trans" and ((ep + 1) % EXAM_EVERY == 0
-                                   or ep == N_EPOCHS - 1):
+            if arm in ("trans", "ranka") and ((ep + 1) % EXAM_EVERY == 0
+                                          or ep == N_EPOCHS - 1):
                 r2 = exam_r2(model, Xex, Yex, Mex)
                 worst = min(v for v in r2.values() if v == v)
                 note += " EXAM " + " ".join(f"{k} {v:.3f}"
@@ -678,7 +681,8 @@ def run_arm(arm, Xtr, Ytr, Mtr, Xte, Yte, Mte, t0):
         den = ((Yte[:, :, j] - Yte[:, :, j].mean()) ** 2 * dm).sum()
         r2v = float(1.0 - num / max(den, 1e-9))
         (r2_v if FEATURE_NAMES[i] in VITALS else r2_l).append(r2v)
-    r2_final = exam_r2(model, Xex, Yex, Mex) if arm == "trans" else None
+    r2_final = exam_r2(model, Xex, Yex, Mex) if arm in ("trans", "ranka") \
+        else None
     ok = r2_all >= 0.90 and (r2_final is None or
                              all(v >= EXAM_FLOOR for v in r2_final.values()))
     print(f"  clinical masked R2 {r2_all:.4f} | vitals {np.mean(r2_v):.3f} "
@@ -723,21 +727,34 @@ def main():
     print(f"  train {Xtr.shape[0]} windows, test {Xte.shape[0]}", flush=True)
 
     reports = [run_arm("trans", Xtr, Ytr, Mtr, Xte, Yte, Mte, t0),
-               run_arm("rand", Xtr, Ytr, Mtr, Xte, Yte, Mte, t0)]
+               run_arm("rand", Xtr, Ytr, Mtr, Xte, Yte, Mte, t0),
+               run_arm("ranka", Xtr, Ytr, Mtr, Xte, Yte, Mte, t0)]
     summary = {r["arm"]: {"final_clinical_r2": r["clinical_masked_r2"],
-                          "epochs_to_0.90": r["epochs_to_0.90"],
-                          "curve": r["clinical_r2_curve"],
-                          "verdict": r["verdict"]} for r in reports}
+                           "epochs_to_0.90": r["epochs_to_0.90"],
+                           "curve": r["clinical_r2_curve"],
+                           "worst_exam": (min(r["exam_r2_final"].values())
+                                          if r.get("exam_r2_final") else None),
+                           "verdict": r["verdict"]} for r in reports}
     print("\n=== SCAFFOLDING SUMMARY ===", flush=True)
-    t = summary["trans"]; r = summary["rand"]
+    t = summary["trans"]; r = summary["rand"]; a = summary["ranka"]
     print(f"  trans: epochs-to-0.90 {t['epochs_to_0.90']} | final "
-          f"{t['final_clinical_r2']:.4f} | {t['verdict']}", flush=True)
+          f"{t['final_clinical_r2']:.4f} | exam {t.get('worst_exam', 'n/a')} "
+          f"| {t['verdict']}", flush=True)
     print(f"  rand : epochs-to-0.90 {r['epochs_to_0.90']} | final "
           f"{r['final_clinical_r2']:.4f} | {r['verdict']}", flush=True)
+    print(f"  ranka: epochs-to-0.90 {a['epochs_to_0.90']} | final "
+          f"{a['final_clinical_r2']:.4f} | exam {a.get('worst_exam', 'n/a')} "
+          f"| {a['verdict']}", flush=True)
     if t["epochs_to_0.90"] and r["epochs_to_0.90"]:
         ratio = r["epochs_to_0.90"] / max(t["epochs_to_0.90"], 1)
-        print(f"  scaffolding speed ratio: {ratio:.2f}x "
-              f"(rand/trans epochs-to-0.90)", flush=True)
+        print(f"  speed ratio rand/trans: {ratio:.2f}x", flush=True)
+    if r["epochs_to_0.90"] and a["epochs_to_0.90"]:
+        rv = "ANCHOR-DOMINATED (gradient war)" if \
+            a["epochs_to_0.90"] >= t["epochs_to_0.90"] * 0.8 else \
+            "PRIORS-DOMINATED (topological stickiness)"
+        print(f"  confound split: {rv} "
+              f"(ranka {a['epochs_to_0.90']} vs trans {t['epochs_to_0.90']} "
+              f"vs rand {r['epochs_to_0.90']})", flush=True)
     with open("/kaggle/working/phase2b_fleet.json", "w") as f:
         json.dump({"summary": summary, "reports": reports}, f, indent=2)
     print(f"[done] {round(time.time() - t0, 1)}s total", flush=True)
