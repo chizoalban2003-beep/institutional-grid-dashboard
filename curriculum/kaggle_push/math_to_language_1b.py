@@ -639,10 +639,28 @@ def load_fisher_normalized():
     n = sum(v.size for v in f2.values())
     mean = total / n
     assert np.isfinite(mean) and mean > 0, f"bad Fisher mean {mean}"
+    # pad grown projections to the 120-dim geometry: F was computed on the
+    # 117-dim crowned model; the language columns are NEW (F=0 there —
+    # uncharged, exactly like demographics).
+    f2p = {}
+    for k, v in f2.items():
+        if k in ("gru.weight_ih_l0", "decode_cell.weight_ih") and \
+                v.shape[1] == 117:
+            pad = np.zeros((v.shape[0], 120 - 117), dtype=np.float64)
+            v = np.concatenate([v, pad], axis=1)
+        if k == "decode_cell.weight_ih" and v.shape[1] == 220:
+            pad = np.zeros((v.shape[0], 227 - 220), dtype=np.float64)
+            v = np.concatenate([v, pad], axis=1)
+        f2p[k] = v
+    f2 = f2p
+    total = sum(float(v.sum()) for v in f2.values())
+    n = sum(v.size for v in f2.values())
+    mean = total / n
+    assert np.isfinite(mean) and mean > 0, f"bad Fisher mean {mean}"
     f2 = {k: torch.tensor(v / mean, dtype=torch.float32)
           for k, v in f2.items()}
-    print(f"[ewc] F_total loaded {len(f2)} keys, mean-1 normalized "
-          f"(raw mean {mean:.2e})", flush=True)
+    print(f"[ewc] F_total loaded {len(f2)} keys, padded to 120-dim, "
+          f"mean-1 normalized (raw mean {mean:.2e})", flush=True)
     return f2
 
 
@@ -732,6 +750,11 @@ def main():
                                  f"{v.shape}")
     print("  crowned weights copied; language columns + vocab head fresh "
           "(zero-init on the grown projections)", flush=True)
+    grown = [k for k, v in crowned.items()
+             if k not in ("vocab_head.weight", "vocab_head.bias")
+             and tuple(dict(model.named_parameters())[k].shape)
+             != tuple(v.shape)]
+    print(f"  grown keys: {grown}", flush=True)
 
     print("[3/6] F_total EWC ledger...", flush=True)
     f2 = load_fisher_normalized()
