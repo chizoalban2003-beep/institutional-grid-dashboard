@@ -56,7 +56,7 @@ RISK_DROP_WEIGHT = 3.0
 # The lambda grid is anchored to the live anchor's measured gradient scale
 # (anchor_grad_norm) so lambda*F*d does real work against clinical drift.
 LAM_SWEEP = [0.3, 1.0, 3.0, 10.0]     # multipliers of anchor-equivalent lam
-FISHER_DATASET = "math-school-fisher-v2"
+FISHER_DATASET = "fisher-v2-full-surface"
 FISHER_FILE = "fisher_v2.npz"
 ANCHOR_OFF = True                     # true-economy: no live exam anchor
 

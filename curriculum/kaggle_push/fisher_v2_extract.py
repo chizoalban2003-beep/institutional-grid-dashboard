@@ -343,7 +343,20 @@ def main():
         F[k] /= N_BATCHES
     for k, v in F.items():
         assert torch.isfinite(v).all(), f"non-finite F on {k}"
-        assert v.sum() > 0.0, f"zero F on {k}"
+    # Structural zeros are HONEST, not failures: scorer (hard topk indices
+    # never receive gradient) and clinical heads (hard-copy y = m*value +
+    # (1-m)*y_est with m=1 -> zero gradient) legitimately have F=0 — the
+    # exam loss does not depend on them, so EWC charges them nothing.
+    # Keys that MUST carry exam-loading:
+    must_carry = ["gru.weight_ih_l0", "gru.weight_hh_l0",
+                  "decode_cell.weight_ih", "decode_cell.weight_hh",
+                  "cell_block.weight", "cell_block.bias",
+                  "heads.0.weight", "heads.5.weight"]
+    for k in must_carry:
+        assert F[k].sum() > 0.0, f"zero F on {k} (expected gradient path)"
+    zero_keys = [k for k, v in F.items() if v.sum() == 0.0]
+    print(f"  structural-zero F keys (allowed): {sorted(zero_keys)}",
+          flush=True)
 
     print("[4/4] save...", flush=True)
     np.savez("/kaggle/working/fisher_v2.npz",
