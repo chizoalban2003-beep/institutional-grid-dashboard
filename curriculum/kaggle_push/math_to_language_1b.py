@@ -744,10 +744,18 @@ def main():
           flush=True)
     XM, YM, MM = exam_windows(192, SEED + 2)     # math exam (certified)
     XC, YC, MC = clinical_windows(64, SEED + 3)  # clinical (mimic contract)
-    XM = torch.tensor(embed_math_block(XM), dtype=torch.float32)
+    def pad_to_120(x117):
+        """117-dim grid -> 120-dim with the language triplet DORMANT
+        (value=0, mask=1, delta=0) — the reverse of embed_language_block."""
+        B, Wn, _ = x117.shape
+        x = np.zeros((B, Wn, D_IN), dtype=np.float32)
+        x[:, :, :117] = x117
+        x[:, :, 118] = 1.0              # language mask channel = observed
+        return x
+    XM = torch.tensor(pad_to_120(embed_math_block(XM)), dtype=torch.float32)
     YM = torch.tensor(YM, dtype=torch.float32)
     MM = torch.tensor(MM, dtype=torch.float32)
-    XC = torch.tensor(XC, dtype=torch.float32)   # already 117-dim
+    XC = torch.tensor(pad_to_120(XC), dtype=torch.float32)  # 117 -> 120
     YC = torch.tensor(YC, dtype=torch.float32)
     MC = torch.tensor(MC, dtype=torch.float32)
     with torch.no_grad():
