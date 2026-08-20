@@ -255,8 +255,6 @@ def embed_math_block(X18: np.ndarray,
 
 
 # <<< VENDOR (mimic_contract) — do not edit outside the reference module
-# ---------------------------- math exam generators (exam machinery)
-
 # CERTIFIED Phase-1 generator, byte-identical to math_school_train.py
 # (lines 55-220, the frozen v9/v10 artifact). The v4/v5 exam used a
 # re-implemented continuum with different constants (A=1 fixed, tau~

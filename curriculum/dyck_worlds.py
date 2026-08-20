@@ -150,4 +150,23 @@ def token_accuracy(pred_logits: np.ndarray, y: np.ndarray,
     return float((pred[dropped] == y[dropped]).mean())
 
 
+def embed_language_block(X3: np.ndarray, total_dim: int = 120) -> np.ndarray:
+    """(B, W, 3) [value, mask, delta] language windows -> (B, W, 120) grid.
+
+    The Phase-2 grid has 117 input columns (39 triplets: 6 math + 33
+    clinical); the language stem is a 40th triplet at columns 117:120.
+    Dormant-slot protocol: when language is active, the math+clinical
+    triplets stay dormant (value=0, mask=1, delta=0) so the shared core
+    sees exactly one domain's signal — zero bandwidth, zero gradient on
+    the other stems (hard copy pins their regression heads to 0).
+    """
+    B, Wn, _ = X3.shape
+    if X3.shape[2] != 3:
+        raise ValueError(f"language windows must be (B, W, 3), got {X3.shape}")
+    grid = np.zeros((B, Wn, total_dim), dtype=np.float32)
+    grid[:, :, 1::3] = 1.0                      # all triplets dormant
+    grid[:, :, total_dim - 3:total_dim] = X3    # language triplet active
+    return grid
+
+
 # <<< VENDOR (dyck_worlds) — do not edit outside the reference module
