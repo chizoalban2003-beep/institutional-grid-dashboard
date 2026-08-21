@@ -584,7 +584,11 @@ class LanguageGrid(nn.Module):
                                       hidden)
         self.heads = nn.ModuleList(
             [nn.Linear(hidden, 1) for _ in range(k_subjects)])
-        self.vocab_head = nn.Linear(hidden, vocab)
+        self.vocab_head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Linear(hidden // 2, vocab),
+        )
         self.k = k
         self.n_cells = n_cells
         self.k_subjects = k_subjects
@@ -797,7 +801,7 @@ def main():
                      (184, 223, 181, 220)]    # prev: shifted +3
     with torch.no_grad():
         for k, v in crowned.items():
-            if k in ("vocab_head.weight", "vocab_head.bias"):
+            if k.startswith("vocab_head"):
                 continue
             p = dict(model.named_parameters())[k]
             if tuple(p.shape) == tuple(v.shape):
@@ -821,7 +825,8 @@ def main():
     print("  crowned weights copied; language columns + vocab head fresh "
           "(zero-init on the grown projections)", flush=True)
     grown = [k for k, v in crowned.items()
-             if k not in ("vocab_head.weight", "vocab_head.bias")
+             if not k.startswith("vocab_head")
+             and k in dict(model.named_parameters())
              and tuple(dict(model.named_parameters())[k].shape)
              != tuple(v.shape)]
     print(f"  grown keys: {grown}", flush=True)
