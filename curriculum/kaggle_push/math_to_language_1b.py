@@ -910,6 +910,13 @@ def main():
                                                   for k, v in
                                                   r2_ctrl.items()),
               flush=True)
+        ctrl_sd = ctrl117.state_dict()
+        diag_w = {k: float(ctrl_sd[k].abs().sum()) for k in
+                  ("heads.0.weight", "gru.weight_ih_l0",
+                   "decode_cell.weight_ih")}
+        print(f"  [diag-ctrl weights] heads.0 {diag_w['heads.0.weight']:.3e} "
+              f"gru_ih {diag_w['gru.weight_ih_l0']:.3e} "
+              f"dec_ih {diag_w['decode_cell.weight_ih']:.3e}", flush=True)
     except Exception as ex:
         print(f"  [diag-ctrl skipped] {ex}", flush=True)
 
