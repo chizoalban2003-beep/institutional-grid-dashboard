@@ -911,12 +911,32 @@ def main():
                                                   r2_ctrl.items()),
               flush=True)
         ctrl_sd = ctrl117.state_dict()
-        diag_w = {k: float(ctrl_sd[k].abs().sum()) for k in
-                  ("heads.0.weight", "gru.weight_ih_l0",
-                   "decode_cell.weight_ih")}
-        print(f"  [diag-ctrl weights] heads.0 {diag_w['heads.0.weight']:.3e} "
-              f"gru_ih {diag_w['gru.weight_ih_l0']:.3e} "
-              f"dec_ih {diag_w['decode_cell.weight_ih']:.3e}", flush=True)
+        # fresh-load crowned dict for comparison
+        crowned_cmp = torch.load(os.path.join(
+            discover_input("crowned-ckpt-fast"), "math2clinic_fast.pt"),
+            map_location="cpu", weights_only=True)
+        print("  [crowned raw]", flush=True)
+        for k in ("heads.0.weight", "gru.weight_ih_l0",
+                  "decode_cell.weight_ih", "gru.weight_hh_l0",
+                  "decode_cell.weight_hh", "heads.0.bias"):
+            if k in crowned_cmp:
+                v = crowned_cmp[k]
+                print(f"    {k}: shape={list(v.shape)} "
+                      f"abs_sum={float(v.abs().sum()):.3e} "
+                      f"mean={float(v.mean()):.6e}", flush=True)
+        print("  [ctrl loaded]", flush=True)
+        for k in ("heads.0.weight", "gru.weight_ih_l0",
+                  "decode_cell.weight_ih", "gru.weight_hh_l0",
+                  "decode_cell.weight_hh", "heads.0.bias"):
+            v = ctrl_sd[k]
+            c = crowned_cmp[k]
+            match = "MATCH" if v.shape == c.shape and (v == c).all().item() else "MISMATCH"
+            print(f"    {k}: shape={list(v.shape)} "
+                  f"abs_sum={float(v.abs().sum()):.3e} "
+                  f"mean={float(v.mean()):.6e} {match}", flush=True)
+        # also: what does the crowned dict's gru.weight_ih_l0 shape[1] look like?
+        print(f"  [crowned gru_ih shape] {list(crowned_cmp['gru.weight_ih_l0'].shape)}", flush=True)
+        print(f"  [crowned dec_ih shape] {list(crowned_cmp['decode_cell.weight_ih'].shape)}", flush=True)
     except Exception as ex:
         print(f"  [diag-ctrl skipped] {ex}", flush=True)
 
