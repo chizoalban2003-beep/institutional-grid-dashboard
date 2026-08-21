@@ -36,6 +36,7 @@ N_TEST_WORDS = 256
 N_EPOCHS = 100
 BATCH = 512
 LR = 1e-4
+LR_LANG = 1e-3           # 10x core LR for the randomly-initialized vocab head
 ACC_FLOOR = 0.90
 ACC_EVERY = 5
 EXAM_KINDS = ["dyck2"]
@@ -678,7 +679,7 @@ class MathSchoolGrid117(nn.Module):
 
 FISHER_DATASET = "fisher-v3-total"
 FISHER_FILE = "fisher_v3.npz"
-LAM_EWC = 10.0                    # the crowned tension (anchor-equivalent)
+LAM_EWC = 20.0                    # doubled to hold math floor while lang trains
 MATH_FLOOR = 0.80
 CLIN_FLOOR = 0.90
 D_IN_117 = 117                    # crowned model's input width
@@ -829,10 +830,15 @@ def main():
     f2 = load_fisher_normalized()
     global _THETA_STAR
     _THETA_STAR = snapshot_theta_star(model, f2)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    opt = torch.optim.Adam([
+        {"params": [p for n, p in model.named_parameters()
+                    if "vocab_head" in n], "lr": LR_LANG},
+        {"params": [p for n, p in model.named_parameters()
+                    if "vocab_head" not in n], "lr": LR},
+    ])
     n_par = sum(p.numel() for p in model.parameters())
-    print(f"  {n_par:,} params | uniform lr {LR} | lam {LAM_EWC:g} | "
-          f"vocab {V_LANG}", flush=True)
+    print(f"  {n_par:,} params | core lr {LR} | lang lr {LR_LANG} | "
+          f"lam {LAM_EWC:g} | vocab {V_LANG}", flush=True)
 
     print("[4/6] legacy exams (math + clinical at crowned init)...",
           flush=True)
@@ -926,7 +932,11 @@ def main():
             _, vlog = model(xb)
             lg = vlog.reshape(-1, V_LANG)
             tg = yb.reshape(-1)
-            loss = nn.functional.cross_entropy(lg, tg)
+            # mask-WEIGHTED CE: only dropped tokens (mb=0) contribute to loss;
+            # observed tokens (mb=1) are context, not prediction targets.
+            mask_w = (1.0 - mb.reshape(-1))
+            ce_raw = nn.functional.cross_entropy(lg, tg, reduction="none")
+            loss = (ce_raw * mask_w).sum() / mask_w.sum().clamp(min=1.0)
             ewc = ewc_penalty(model, f2, LAM_EWC)
             loss = loss + ewc
             loss.backward()
