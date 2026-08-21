@@ -620,6 +620,54 @@ class LanguageGrid(nn.Module):
         return out, vlog
 
 
+class MathSchoolGrid117(nn.Module):
+    """Certified 117-dim grid (no vocab head) — the diag-proven control
+    that reproduces the crowned exam (sine 0.976, lorenz 0.857)."""
+
+    def __init__(self, d_in, hidden, n_cells, k, k_subjects):
+        super().__init__()
+        self.gru = nn.GRU(d_in, hidden, batch_first=True)
+        self.scorer = nn.Linear(hidden, n_cells)
+        self.cell_block = nn.Linear(hidden, n_cells * 64)
+        self.decode_cell = nn.GRUCell(d_in + 64 + k_subjects, hidden)
+        self.heads = nn.ModuleList(
+            [nn.Linear(hidden, 1) for _ in range(k_subjects)])
+        self.k = k
+        self.n_cells = n_cells
+        self.k_subjects = k_subjects
+
+    def forward(self, x, return_routing=False):
+        B, Wn, D = x.shape
+        h, _ = self.gru(x)
+        h_last = h[:, -1]
+        scores = self.scorer(h_last)
+        topk = torch.topk(scores, self.k, dim=1)
+        votes = torch.zeros(B, self.n_cells, device=x.device)
+        votes.scatter_(1, topk.indices, 1.0)
+        cells = torch.relu(self.cell_block(h_last))
+        cells = cells.view(B, self.n_cells, 64)
+        selected = torch.gather(cells, 1,
+                                topk.indices.unsqueeze(-1).expand(-1, -1, 64))
+        pooled = selected.mean(dim=1)
+        value = x[:, :, 0::3][:, :, :self.k_subjects]
+        m = x[:, :, 1::3][:, :, :self.k_subjects]
+        state = h_last.contiguous()
+        prev = torch.zeros(B, self.k_subjects, device=x.device)
+        outs = []
+        for t in range(Wn):
+            ctx = torch.cat([x[:, t], pooled, prev], dim=1)
+            state = self.decode_cell(ctx, state)
+            y_est = torch.cat(
+                [head(state) for head in self.heads], dim=1)
+            y = m[:, t] * value[:, t] + (1.0 - m[:, t]) * y_est
+            outs.append(y)
+            prev = y
+        out = torch.stack(outs, dim=1)
+        if return_routing:
+            return out, votes
+        return out
+
+
 # ---------------------------- Gate 1b machinery
 
 FISHER_DATASET = "fisher-v3-total"
@@ -783,6 +831,7 @@ def main():
     print("[4/6] legacy exams (math + clinical at crowned init)...",
           flush=True)
     XM, YM, MM = exam_windows(192, SEED + 2)     # math exam (certified)
+    XM18 = XM                                    # keep 18-dim for the control
     XC, YC, MC = clinical_windows(64, SEED + 3)  # clinical (mimic contract)
     def embed_math_inline(X18):
         """DIAG-PROVEN math embed: (B,W,18) -> (B,W,117), clinical dormant.
@@ -831,6 +880,38 @@ def main():
     print("  math base: " + " ".join(f"{k} {v:.3f}"
                                      for k, v in r2_math.items()), flush=True)
     print(f"  clinical base: {r2_clin:.4f}", flush=True)
+
+    # ---- DIAGNOSTIC CONTROL: 117-dim crowned repro on the same windows
+    import copy as _copy
+    ctrl = _copy.deepcopy(model)
+    # strip to a 117-dim MathSchoolGrid: not possible in-place; instead
+    # evaluate a fresh 117-dim grid with the crowned weights
+    try:
+        ctrl117 = MathSchoolGrid117(D_IN_117, HIDDEN, N_CELLS, K_ACTIVE,
+                                    K_SUBJECTS)
+        ctrl117.load_state_dict(
+            torch.load(os.path.join(discover_input("crowned-ckpt-fast"),
+                                    "math2clinic_fast.pt"),
+                       map_location="cpu", weights_only=True), strict=True)
+        ctrl117.eval()
+        with torch.no_grad():
+            p117 = ctrl117(torch.tensor(embed_math_inline(XM18),
+                                        dtype=torch.float32))
+        r2_ctrl = {k: float(1.0 - (((p117[:, :, i:i+1] - YM[:, :, i:i+1])
+                                    ** 2) * (1.0 - MM[:, :, i:i+1])).sum()
+                             / max((((YM[:, :, i:i+1]
+                                      - YM[:, :, i:i+1].mean(dim=(0, 1),
+                                                             keepdim=True))
+                                     ** 2) * (1.0 - MM[:, :, i:i+1])).sum(),
+                                    1e-9))
+                   for i, k in enumerate(["sine", "cosine", "decay", "step",
+                                          "sigmoid", "lorenz"])}
+        print("  [diag-ctrl 117-dim] " + " ".join(f"{k} {v:.3f}"
+                                                  for k, v in
+                                                  r2_ctrl.items()),
+              flush=True)
+    except Exception as ex:
+        print(f"  [diag-ctrl skipped] {ex}", flush=True)
 
     print("[5/6] training (Dyck-2 CE + F_total EWC lam=10)...", flush=True)
     n = Xtr.shape[0]
