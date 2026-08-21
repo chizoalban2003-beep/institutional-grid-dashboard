@@ -917,14 +917,16 @@ def main():
                                      for k, v in r2_ctrl.items()),
           flush=True)
 
-    print("[5/6] training (Dyck-2 CE + F_total EWC lam=10)...", flush=True)
+    print("[5/6] training (Dyck-2 CE + F_total EWC)...", flush=True)
     n = Xtr.shape[0]
     n_batches = (n + BATCH - 1) // BATCH
+    WARMUP_EPC = 25                # no EWC for first 25 eps — let GRU route lang
     curve = []
     for ep in range(N_EPOCHS):
         perm = torch.randperm(n)
         tot = 0.0
         ewc_tot = 0.0
+        use_ewc = ep >= WARMUP_EPC
         for i in range(n_batches):
             idx = perm[i * BATCH: (i + 1) * BATCH]
             xb, yb, mb = Xtr[idx], Ytr[idx], Mtr[idx]
@@ -937,12 +939,13 @@ def main():
             mask_w = (1.0 - mb.reshape(-1))
             ce_raw = nn.functional.cross_entropy(lg, tg, reduction="none")
             loss = (ce_raw * mask_w).sum() / mask_w.sum().clamp(min=1.0)
-            ewc = ewc_penalty(model, f2, LAM_EWC)
-            loss = loss + ewc
+            if use_ewc:
+                ewc = ewc_penalty(model, f2, LAM_EWC)
+                loss = loss + ewc
+                ewc_tot += float(ewc)
             loss.backward()
             opt.step()
-            tot += float(loss - ewc)
-            ewc_tot += float(ewc)
+            tot += float(loss - (ewc if use_ewc else 0.0))
         note = ""
         if (ep + 1) % ACC_EVERY == 0 or ep == N_EPOCHS - 1:
             with torch.no_grad():
@@ -969,7 +972,8 @@ def main():
             curve.append({"epoch": ep + 1, "cons": cons, "acc": acc,
                           "math_worst": worst_m, "clin": r2c})
             note = f" CONS {cons:.4f} | math {worst_m:.3f} clin {r2c:.3f}"
-        print(f"  ep {ep:3d} loss {tot / n_batches:9.4f} "
+        phase = "" if use_ewc else " W"
+        print(f"  ep {ep:3d}{phase} loss {tot / n_batches:9.4f} "
               f"ewc {ewc_tot / n_batches:9.4f}{note}", flush=True)
 
     print("[6/6] final triple verdict...", flush=True)
