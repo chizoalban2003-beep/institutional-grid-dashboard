@@ -937,6 +937,20 @@ def main():
         # also: what does the crowned dict's gru.weight_ih_l0 shape[1] look like?
         print(f"  [crowned gru_ih shape] {list(crowned_cmp['gru.weight_ih_l0'].shape)}", flush=True)
         print(f"  [crowned dec_ih shape] {list(crowned_cmp['decode_cell.weight_ih'].shape)}", flush=True)
+        # ---- INPUT FINGERPRINTS ----
+        xm_np = embed_math_inline(XM18)
+        print(f"  [input fp] X117 shape {xm_np.shape} min {xm_np.min():.6f} "
+              f"max {xm_np.max():.6f} mean {xm_np.mean():.6f}", flush=True)
+        # first 5 values of sine channel (col 0) in window 0
+        print(f"  [input fp] w0 sine[:5] = {xm_np[0, :5, 0].tolist()}", flush=True)
+        print(f"  [input fp] w0 mask[:5] = {xm_np[0, :5, 1].tolist()}", flush=True)
+        print(f"  [input fp] w0 delta[:5] = {xm_np[0, :5, 2].tolist()}", flush=True)
+        # first 5 values of pred (sine head = output channel 0)
+        print(f"  [pred fp] ctrl117 w0 sine[:5] = {p117[0, :5, 0].tolist()}", flush=True)
+        # also: is the 120-dim model's input the same?
+        xm120 = pad_to_120(xm_np)
+        print(f"  [input fp] X120 shape {xm120.shape} lang_cols "
+              f"mean={xm120[:,:,117:].mean():.6f}", flush=True)
     except Exception as ex:
         print(f"  [diag-ctrl skipped] {ex}", flush=True)
 

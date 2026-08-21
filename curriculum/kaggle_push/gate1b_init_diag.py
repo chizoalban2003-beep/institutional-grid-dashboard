@@ -177,11 +177,19 @@ def main():
     r2_120 = _math_r2(p120, YM, MM)
 
     print("117-dim repro : " + " ".join(f"{k} {v:.3f}"
-                                        for k, v in r2_117.items()),
+                                         for k, v in r2_117.items()),
           flush=True)
     print("120-dim ext   : " + " ".join(f"{k} {v:.3f}"
-                                        for k, v in r2_120.items()),
+                                         for k, v in r2_120.items()),
           flush=True)
+    # ---- INPUT/PRED FINGERPRINTS (for 1b comparison) ----
+    xm_np = _embed_math(X18)
+    print(f"  [input fp] X117 shape {xm_np.shape} min {xm_np.min():.6f} "
+          f"max {xm_np.max():.6f} mean {xm_np.mean():.6f}", flush=True)
+    print(f"  [input fp] w0 sine[:5] = {xm_np[0, :5, 0].tolist()}", flush=True)
+    print(f"  [input fp] w0 mask[:5] = {xm_np[0, :5, 1].tolist()}", flush=True)
+    print(f"  [input fp] w0 delta[:5] = {xm_np[0, :5, 2].tolist()}", flush=True)
+    print(f"  [pred fp] model117 w0 sine[:5] = {p117[0, :5, 0].tolist()}", flush=True)
     report = {"r2_117": r2_117, "r2_120": r2_120}
     with open("/kaggle/working/init_diag.json", "w") as f:
         json.dump(report, f, indent=2)
