@@ -133,6 +133,8 @@ def main():
 
     # --- build the certified math exam (18-dim windows) ---
     X18, YM, MM = _exam_windows(192, SEED + 2)
+    YM = torch.tensor(YM, dtype=torch.float32)
+    MM = torch.tensor(MM, dtype=torch.float32)
 
     # --- model A: 117-dim exact repro ---
     model117 = MathSchoolGrid(D_IN_117, HIDDEN, N_CELLS, K_ACTIVE,
@@ -169,7 +171,9 @@ def main():
     model120.eval()
     X120 = torch.tensor(_pad120(_embed_math(X18)), dtype=torch.float32)
     with torch.no_grad():
-        p120, _ = model120(X120)
+        p120 = model120(X120)
+        if isinstance(p120, tuple):
+            p120 = p120[0]
     r2_120 = _math_r2(p120, YM, MM)
 
     print("117-dim repro : " + " ".join(f"{k} {v:.3f}"
