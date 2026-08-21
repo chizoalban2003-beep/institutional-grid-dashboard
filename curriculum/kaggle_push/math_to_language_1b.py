@@ -410,6 +410,12 @@ def embed_math_block(X18: np.ndarray,
 
 # <<< VENDOR (mimic_contract) — do not edit outside the reference module
 
+# OVERRIDE: the vendored dyck_worlds block defines EXAM_KINDS = ["dyck2"]
+# which is wrong for the math exam — damage() iterates EXAM_KINDS to set
+# value/mask/delta per channel, so ["dyck2"] only processes 1 of 6 channels
+# (the other 5 get zeros → model sees wrong input → 0.352/0.599 scores).
+EXAM_KINDS = ["sine", "cosine", "decay", "step", "sigmoid", "lorenz"]
+
 # ---------------------------- certified math exam machinery
 
 T_STAY = 256
