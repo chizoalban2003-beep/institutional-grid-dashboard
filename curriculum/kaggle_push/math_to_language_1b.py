@@ -683,7 +683,7 @@ class MathSchoolGrid117(nn.Module):
 
 FISHER_DATASET = "fisher-v3-total"
 FISHER_FILE = "fisher_v3.npz"
-LAM_EWC = 5.0                     # lowered to let GRU adapt recurrent state for Dyck-2
+LAM_EWC = 2.0                     # weakened to let MLP-held lang settle near peak
 MATH_FLOOR = 0.80
 CLIN_FLOOR = 0.90
 D_IN_117 = 117                    # crowned model's input width
@@ -925,7 +925,7 @@ def main():
     print("[5/6] training (Dyck-2 CE + F_total EWC)...", flush=True)
     n = Xtr.shape[0]
     n_batches = (n + BATCH - 1) // BATCH
-    WARMUP_EPC = 25                # no EWC for first 25 eps — let GRU route lang
+    WARMUP_EPC = 30                # no EWC for first 30 eps — let MLP settle lang
     curve = []
     for ep in range(N_EPOCHS):
         perm = torch.randperm(n)
