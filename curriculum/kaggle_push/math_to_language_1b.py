@@ -784,6 +784,17 @@ def main():
           flush=True)
     XM, YM, MM = exam_windows(192, SEED + 2)     # math exam (certified)
     XC, YC, MC = clinical_windows(64, SEED + 3)  # clinical (mimic contract)
+    def embed_math_inline(X18):
+        """DIAG-PROVEN math embed: (B,W,18) -> (B,W,117), clinical dormant.
+        (Uses an explicit local copy — the vendored embed_math_block
+        resolves D_IN/total_dim differently at runtime and scored math
+        base 0.352 vs the diag's 0.973 on identical windows.)"""
+        B, Wn, _ = X18.shape
+        g = np.zeros((B, Wn, 117), dtype=np.float32)
+        g[:, :, 1::3] = 1.0
+        g[:, :, :K_MATH * 3] = X18
+        return g
+
     def pad_to_120(x117):
         """117-dim grid -> 120-dim with the language triplet DORMANT
         (value=0, mask=1, delta=0) — the reverse of embed_language_block."""
@@ -792,10 +803,12 @@ def main():
         x[:, :, :117] = x117
         x[:, :, 118] = 1.0              # language mask channel = observed
         return x
-    XM = torch.tensor(pad_to_120(embed_math_block(XM)), dtype=torch.float32)
+    XM = torch.tensor(pad_to_120(embed_math_inline(XM)), dtype=torch.float32)
     YM = torch.tensor(YM, dtype=torch.float32)
     MM = torch.tensor(MM, dtype=torch.float32)
     XC = torch.tensor(pad_to_120(XC), dtype=torch.float32)  # 117 -> 120
+    # (clinical windows are already (B,W,117) with math dormant — the
+    #  diag's clinical base 0.9923 matched crowned 0.997 through this path)
     YC = torch.tensor(YC, dtype=torch.float32)
     MC = torch.tensor(MC, dtype=torch.float32)
     with torch.no_grad():
