@@ -887,78 +887,29 @@ def main():
                                      for k, v in r2_math.items()), flush=True)
     print(f"  clinical base: {r2_clin:.4f}", flush=True)
 
-    # ---- DIAGNOSTIC CONTROL: 117-dim crowned repro on the same windows
-    import copy as _copy
-    ctrl = _copy.deepcopy(model)
-    # strip to a 117-dim MathSchoolGrid: not possible in-place; instead
-    # evaluate a fresh 117-dim grid with the crowned weights
-    try:
-        ctrl117 = MathSchoolGrid117(D_IN_117, HIDDEN, N_CELLS, K_ACTIVE,
-                                    K_SUBJECTS)
-        ctrl117.load_state_dict(
-            torch.load(os.path.join(discover_input("crowned-ckpt-fast"),
-                                    "math2clinic_fast.pt"),
-                       map_location="cpu", weights_only=True), strict=True)
-        ctrl117.eval()
-        with torch.no_grad():
-            p117 = ctrl117(torch.tensor(embed_math_inline(XM18),
-                                        dtype=torch.float32))
-        r2_ctrl = {k: float(1.0 - (((p117[:, :, i:i+1] - YM[:, :, i:i+1])
-                                    ** 2) * (1.0 - MM[:, :, i:i+1])).sum()
-                             / max((((YM[:, :, i:i+1]
-                                      - YM[:, :, i:i+1].mean(dim=(0, 1),
-                                                             keepdim=True))
-                                     ** 2) * (1.0 - MM[:, :, i:i+1])).sum(),
-                                    1e-9))
-                   for i, k in enumerate(["sine", "cosine", "decay", "step",
-                                          "sigmoid", "lorenz"])}
-        print("  [diag-ctrl 117-dim] " + " ".join(f"{k} {v:.3f}"
-                                                  for k, v in
-                                                  r2_ctrl.items()),
-              flush=True)
-        ctrl_sd = ctrl117.state_dict()
-        # fresh-load crowned dict for comparison
-        crowned_cmp = torch.load(os.path.join(
-            discover_input("crowned-ckpt-fast"), "math2clinic_fast.pt"),
-            map_location="cpu", weights_only=True)
-        print("  [crowned raw]", flush=True)
-        for k in ("heads.0.weight", "gru.weight_ih_l0",
-                  "decode_cell.weight_ih", "gru.weight_hh_l0",
-                  "decode_cell.weight_hh", "heads.0.bias"):
-            if k in crowned_cmp:
-                v = crowned_cmp[k]
-                print(f"    {k}: shape={list(v.shape)} "
-                      f"abs_sum={float(v.abs().sum()):.3e} "
-                      f"mean={float(v.mean()):.6e}", flush=True)
-        print("  [ctrl loaded]", flush=True)
-        for k in ("heads.0.weight", "gru.weight_ih_l0",
-                  "decode_cell.weight_ih", "gru.weight_hh_l0",
-                  "decode_cell.weight_hh", "heads.0.bias"):
-            v = ctrl_sd[k]
-            c = crowned_cmp[k]
-            match = "MATCH" if v.shape == c.shape and (v == c).all().item() else "MISMATCH"
-            print(f"    {k}: shape={list(v.shape)} "
-                  f"abs_sum={float(v.abs().sum()):.3e} "
-                  f"mean={float(v.mean()):.6e} {match}", flush=True)
-        # also: what does the crowned dict's gru.weight_ih_l0 shape[1] look like?
-        print(f"  [crowned gru_ih shape] {list(crowned_cmp['gru.weight_ih_l0'].shape)}", flush=True)
-        print(f"  [crowned dec_ih shape] {list(crowned_cmp['decode_cell.weight_ih'].shape)}", flush=True)
-        # ---- INPUT FINGERPRINTS ----
-        xm_np = embed_math_inline(XM18)
-        print(f"  [input fp] X117 shape {xm_np.shape} min {xm_np.min():.6f} "
-              f"max {xm_np.max():.6f} mean {xm_np.mean():.6f}", flush=True)
-        # first 5 values of sine channel (col 0) in window 0
-        print(f"  [input fp] w0 sine[:5] = {xm_np[0, :5, 0].tolist()}", flush=True)
-        print(f"  [input fp] w0 mask[:5] = {xm_np[0, :5, 1].tolist()}", flush=True)
-        print(f"  [input fp] w0 delta[:5] = {xm_np[0, :5, 2].tolist()}", flush=True)
-        # first 5 values of pred (sine head = output channel 0)
-        print(f"  [pred fp] ctrl117 w0 sine[:5] = {p117[0, :5, 0].tolist()}", flush=True)
-        # also: is the 120-dim model's input the same?
-        xm120 = pad_to_120(xm_np)
-        print(f"  [input fp] X120 shape {xm120.shape} lang_cols "
-              f"mean={xm120[:,:,117:].mean():.6f}", flush=True)
-    except Exception as ex:
-        print(f"  [diag-ctrl skipped] {ex}", flush=True)
+    # ---- 117-dim control (sanity: crowned exam baseline) ----
+    ctrl117 = MathSchoolGrid117(D_IN_117, HIDDEN, N_CELLS, K_ACTIVE,
+                                K_SUBJECTS)
+    ctrl117.load_state_dict(
+        torch.load(os.path.join(discover_input("crowned-ckpt-fast"),
+                                "math2clinic_fast.pt"),
+                   map_location="cpu", weights_only=True), strict=True)
+    ctrl117.eval()
+    with torch.no_grad():
+        p117 = ctrl117(torch.tensor(embed_math_inline(XM18),
+                                    dtype=torch.float32))
+    r2_ctrl = {k: float(1.0 - (((p117[:, :, i:i+1] - YM[:, :, i:i+1])
+                                ** 2) * (1.0 - MM[:, :, i:i+1])).sum()
+                         / max((((YM[:, :, i:i+1]
+                                  - YM[:, :, i:i+1].mean(dim=(0, 1),
+                                                         keepdim=True))
+                                 ** 2) * (1.0 - MM[:, :, i:i+1])).sum(),
+                                1e-9))
+               for i, k in enumerate(["sine", "cosine", "decay", "step",
+                                      "sigmoid", "lorenz"])}
+    print("  [ctrl 117] " + " ".join(f"{k} {v:.3f}"
+                                     for k, v in r2_ctrl.items()),
+          flush=True)
 
     print("[5/6] training (Dyck-2 CE + F_total EWC lam=10)...", flush=True)
     n = Xtr.shape[0]
