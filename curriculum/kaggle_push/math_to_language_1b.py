@@ -679,7 +679,7 @@ class MathSchoolGrid117(nn.Module):
 
 FISHER_DATASET = "fisher-v3-total"
 FISHER_FILE = "fisher_v3.npz"
-LAM_EWC = 20.0                    # doubled to hold math floor while lang trains
+LAM_EWC = 5.0                     # lowered to let GRU adapt recurrent state for Dyck-2
 MATH_FLOOR = 0.80
 CLIN_FLOOR = 0.90
 D_IN_117 = 117                    # crowned model's input width
